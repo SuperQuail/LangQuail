@@ -1,4 +1,18 @@
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
 coverage.out
 coverage.html
 lqcover-*.out
 duplicate.cover
+*.exe
+*.test
+vendor/
