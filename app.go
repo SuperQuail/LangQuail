@@ -19,15 +19,18 @@ type AppBuilder struct {
 	tools     []tool.Executable
 	workflows []graph.Workflow
 	store     any
+	adjuster  any
 }
 
 type App struct {
-	projectID string
-	providers llm.ProviderSet
-	prompts   *prompt.Registry
-	tools     *tool.Registry
-	workflows map[string]graph.Workflow
-	store     any
+	projectID    string
+	providers    llm.ProviderSet
+	prompts      *prompt.Registry
+	tools        *tool.Registry
+	workflows    map[string]graph.Workflow
+	store        any
+	llmAdjuster  llm.Adjuster
+	toolAdjuster tool.Adjuster
 }
 
 func New(projectID string) *AppBuilder {
@@ -74,6 +77,14 @@ func (b *AppBuilder) Store(store any) *AppBuilder {
 	return b
 }
 
+func (b *AppBuilder) Adjuster(adjuster any) *AppBuilder {
+	if b == nil {
+		return b
+	}
+	b.adjuster = adjuster
+	return b
+}
+
 func (b *AppBuilder) Build() (*App, error) {
 	if b == nil {
 		return nil, errors.New("langquail: nil app builder")
@@ -106,6 +117,16 @@ func (b *AppBuilder) Build() (*App, error) {
 		}
 	}
 
+	var llmAdjuster llm.Adjuster
+	var toolAdjuster tool.Adjuster
+	if b.adjuster != nil {
+		llmAdjuster, _ = b.adjuster.(llm.Adjuster)
+		toolAdjuster, _ = b.adjuster.(tool.Adjuster)
+		if llmAdjuster == nil && toolAdjuster == nil {
+			return nil, errors.New("langquail: adjuster must implement llm.Adjuster, tool.Adjuster, or both")
+		}
+	}
+
 	workflows := make(map[string]graph.Workflow, len(b.workflows))
 	for _, workflow := range b.workflows {
 		if workflow == nil {
@@ -125,12 +146,14 @@ func (b *AppBuilder) Build() (*App, error) {
 	}
 
 	return &App{
-		projectID: b.projectID,
-		providers: providers,
-		prompts:   prompts,
-		tools:     tools,
-		workflows: workflows,
-		store:     b.store,
+		projectID:    b.projectID,
+		providers:    providers,
+		prompts:      prompts,
+		tools:        tools,
+		workflows:    workflows,
+		store:        b.store,
+		llmAdjuster:  llmAdjuster,
+		toolAdjuster: toolAdjuster,
 	}, nil
 }
 
@@ -167,6 +190,20 @@ func (a *App) StoreConfig() any {
 		return nil
 	}
 	return a.store
+}
+
+func (a *App) LLMAdjuster() llm.Adjuster {
+	if a == nil {
+		return nil
+	}
+	return a.llmAdjuster
+}
+
+func (a *App) ToolAdjuster() tool.Adjuster {
+	if a == nil {
+		return nil
+	}
+	return a.toolAdjuster
 }
 
 func (a *App) Workflow(id string) (graph.Workflow, bool) {
@@ -211,6 +248,12 @@ func (a *App) Context(ctx context.Context) context.Context {
 	ctx = llm.WithProviders(ctx, a.providers)
 	ctx = llm.WithToolSpecResolver(ctx, a.tools)
 	ctx = tool.WithRegistry(ctx, a.tools)
+	if a.llmAdjuster != nil {
+		ctx = llm.WithAdjuster(ctx, a.llmAdjuster)
+	}
+	if a.toolAdjuster != nil {
+		ctx = tool.WithAdjuster(ctx, a.toolAdjuster)
+	}
 	if a.prompts != nil {
 		ctx = prompt.WithRegistry(ctx, a.prompts)
 	}

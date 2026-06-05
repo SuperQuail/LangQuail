@@ -186,11 +186,46 @@ func TestAppBuilderValidationErrors(t *testing.T) {
 			t.Fatal("Build() error is nil")
 		}
 	})
+
+	t.Run("unsupported adjuster", func(t *testing.T) {
+		_, err := lq.New("project").Adjuster(struct{}{}).Build()
+		if err == nil || !strings.Contains(err.Error(), "adjuster must implement") {
+			t.Fatalf("Build() error = %v", err)
+		}
+	})
+}
+
+func TestAppBuilderRegistersOptionalAdjusterInContext(t *testing.T) {
+	adjuster := &appAdjuster{}
+	app, err := lq.New("project").Adjuster(adjuster).Build()
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if app.LLMAdjuster() != adjuster || app.ToolAdjuster() != adjuster {
+		t.Fatalf("adjusters = llm:%#v tool:%#v", app.LLMAdjuster(), app.ToolAdjuster())
+	}
+	ctx := app.Context(context.Background())
+	if contextual, ok := llm.AdjusterFromContext(ctx); !ok || contextual != adjuster {
+		t.Fatalf("llm adjuster from context = %#v ok=%v", contextual, ok)
+	}
+	if contextual, ok := tool.AdjusterFromContext(ctx); !ok || contextual != adjuster {
+		t.Fatalf("tool adjuster from context = %#v ok=%v", contextual, ok)
+	}
 }
 
 type appProvider struct {
 	name     string
 	requests []llm.Request
+}
+
+type appAdjuster struct{}
+
+func (a *appAdjuster) BeforeLLM(ctx context.Context, request llm.BeforeLLMRequest) (llm.BeforeLLMResult, error) {
+	return llm.BeforeLLMResult{}, nil
+}
+
+func (a *appAdjuster) AfterTool(ctx context.Context, request tool.AfterToolRequest) (tool.AfterToolResult, error) {
+	return tool.AfterToolResult{}, nil
 }
 
 func (p *appProvider) Name() string {

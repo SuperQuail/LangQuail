@@ -136,7 +136,7 @@ func Node[S any](id string, spec NodeSpec[S]) graph.NodeSpec[S] {
 				if err := requireAllowedTool(call.Name, spec.ToolIDs); err != nil {
 					return graph.Noop[S](), err
 				}
-				result, command, err := executeCall[S](ctx, registry, call)
+				result, command, err := executeCall[S](ctx, id, spec.Metadata, registry, call)
 				if err != nil {
 					if spec.Error != nil {
 						return spec.Error(ctx, state, call, err)
@@ -192,7 +192,7 @@ func requireAllowedTool(name string, allowed []string) error {
 	return fmt.Errorf("tool: tool %q is not allowed for this node", name)
 }
 
-func executeCall[S any](ctx context.Context, registry *Registry, call Call) (Result, graph.Command[S], error) {
+func executeCall[S any](ctx context.Context, nodeID string, metadata map[string]string, registry *Registry, call Call) (Result, graph.Command[S], error) {
 	item, exists := registry.Get(call.Name)
 	if !exists {
 		return Result{}, graph.Noop[S](), fmt.Errorf("tool: tool %q is not registered", call.Name)
@@ -233,10 +233,41 @@ func executeCall[S any](ctx context.Context, registry *Registry, call Call) (Res
 	}
 	result.CallID = call.ID
 	result.Name = call.Name
+	result, err = applyAfterToolAdjuster(ctx, nodeID, metadata, call, result)
+	if err != nil {
+		return Result{}, graph.Noop[S](), err
+	}
 	if _, err := trace.Emit(ctx, trace.EventToolCompleted, result); err != nil {
 		return Result{}, graph.Noop[S](), err
 	}
 	return result, graph.Noop[S](), nil
+}
+
+func applyAfterToolAdjuster(ctx context.Context, nodeID string, metadata map[string]string, call Call, result Result) (Result, error) {
+	adjuster, ok := AdjusterFromContext(ctx)
+	if !ok {
+		return result, nil
+	}
+	adjusted, err := adjuster.AfterTool(ctx, AfterToolRequest{
+		NodeID:   nodeID,
+		Call:     cloneCall(call),
+		Result:   cloneResult(result),
+		Metadata: cloneStringMap(metadata),
+	})
+	if err != nil {
+		return Result{}, err
+	}
+	if adjusted.Result == nil {
+		return result, nil
+	}
+	next := cloneResult(*adjusted.Result)
+	if next.CallID == "" {
+		next.CallID = call.ID
+	}
+	if next.Name == "" {
+		next.Name = call.Name
+	}
+	return next, nil
 }
 
 func ErrorResult(call Call, err error) Result {

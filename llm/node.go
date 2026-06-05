@@ -89,6 +89,10 @@ func Node[S any](id string, spec NodeSpec[S]) graph.NodeSpec[S] {
 				MaxTokens:  spec.MaxTokens,
 				Reasoning:  cloneReasoningConfig(spec.Reasoning),
 			}
+			request, err = applyBeforeLLMAdjuster(ctx, id, spec, request)
+			if err != nil {
+				return graph.Noop[S](), err
+			}
 			if _, err := trace.Emit(ctx, trace.EventPromptRendered, request); err != nil {
 				return graph.Noop[S](), err
 			}
@@ -152,6 +156,33 @@ func Node[S any](id string, spec NodeSpec[S]) graph.NodeSpec[S] {
 			return command, nil
 		},
 	}
+}
+
+func applyBeforeLLMAdjuster[S any](ctx context.Context, nodeID string, spec NodeSpec[S], request Request) (Request, error) {
+	adjuster, ok := AdjusterFromContext(ctx)
+	if !ok {
+		return request, nil
+	}
+	result, err := adjuster.BeforeLLM(ctx, BeforeLLMRequest{
+		NodeID:   nodeID,
+		Provider: request.Provider,
+		Model:    request.Model,
+		PromptID: spec.PromptID,
+		Messages: cloneMessages(request.Messages),
+		Tools:    cloneToolSpecs(request.Tools),
+		Budget: lqtoken.Budget{
+			ContextLimit:    spec.ContextLimit,
+			MaxOutputTokens: spec.MaxTokens,
+		},
+		Metadata: cloneStringMap(spec.Metadata),
+	})
+	if err != nil {
+		return Request{}, err
+	}
+	if result.Messages != nil {
+		request.Messages = cloneMessages(result.Messages)
+	}
+	return request, nil
 }
 
 func resolveMessages[S any](ctx context.Context, state S, spec NodeSpec[S]) ([]Message, error) {
