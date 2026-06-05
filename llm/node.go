@@ -3,8 +3,11 @@ package llm
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/superquail/langquail/graph"
+	lqprompt "github.com/superquail/langquail/prompt"
+	lqtoken "github.com/superquail/langquail/token"
 	"github.com/superquail/langquail/trace"
 )
 
@@ -19,23 +22,34 @@ type MessagePolicy[S any] struct {
 }
 
 type NodeSpec[S any] struct {
-	Providers  ProviderSet
-	Provider   string
-	Model      string
-	Messages   MessagePolicy[S]
-	Tools      []ToolSpec
-	ToolChoice ToolChoice
-	MaxTokens  int64
-	Stream     bool
-	Reasoning  *ReasoningConfig
-	Output     func(context.Context, S, Response) (graph.Command[S], error)
-	Metadata   map[string]string
+	Providers      ProviderSet
+	Provider       string
+	Model          string
+	PromptID       string
+	Data           func(context.Context, S) (map[string]any, error)
+	Messages       MessagePolicy[S]
+	Tools          []ToolSpec
+	ToolIDs        []string
+	ToolChoice     ToolChoice
+	MaxTokens      int64
+	ContextLimit   int64
+	TokenEstimator lqtoken.Estimator
+	Stream         bool
+	Reasoning      *ReasoningConfig
+	Output         func(context.Context, S, Response) (graph.Command[S], error)
+	Metadata       map[string]string
 }
 
 func Node[S any](id string, spec NodeSpec[S]) graph.NodeSpec[S] {
 	metadata := map[string]string{
 		"provider": spec.Provider,
 		"model":    spec.Model,
+	}
+	if spec.PromptID != "" {
+		metadata["prompt_id"] = spec.PromptID
+	}
+	if len(spec.ToolIDs) > 0 {
+		metadata["tool_ids"] = strings.Join(spec.ToolIDs, ",")
 	}
 	for key, value := range spec.Metadata {
 		metadata[key] = value
@@ -45,14 +59,21 @@ func Node[S any](id string, spec NodeSpec[S]) graph.NodeSpec[S] {
 		Kind:     graph.NodeKindLLM,
 		Metadata: metadata,
 		Run: func(ctx context.Context, state S) (graph.Command[S], error) {
-			if spec.Messages.Read == nil {
-				return graph.Noop[S](), errors.New("llm: message reader is required")
+			providers := spec.Providers
+			if len(providers.providers) == 0 {
+				if contextual, ok := ProvidersFromContext(ctx); ok {
+					providers = contextual
+				}
 			}
-			provider, err := spec.Providers.Get(spec.Provider)
+			provider, err := providers.Get(spec.Provider)
 			if err != nil {
 				return graph.Noop[S](), err
 			}
-			messages, err := spec.Messages.Read(ctx, state)
+			messages, err := resolveMessages(ctx, state, spec)
+			if err != nil {
+				return graph.Noop[S](), err
+			}
+			tools, err := resolveToolSpecs(ctx, spec)
 			if err != nil {
 				return graph.Noop[S](), err
 			}
@@ -63,12 +84,15 @@ func Node[S any](id string, spec NodeSpec[S]) graph.NodeSpec[S] {
 				Provider:   spec.Provider,
 				Model:      spec.Model,
 				Messages:   append([]Message(nil), messages...),
-				Tools:      append([]ToolSpec(nil), spec.Tools...),
+				Tools:      tools,
 				ToolChoice: spec.ToolChoice,
 				MaxTokens:  spec.MaxTokens,
 				Reasoning:  cloneReasoningConfig(spec.Reasoning),
 			}
 			if _, err := trace.Emit(ctx, trace.EventPromptRendered, request); err != nil {
+				return graph.Noop[S](), err
+			}
+			if err := estimatePromptTokens(ctx, spec, request); err != nil {
 				return graph.Noop[S](), err
 			}
 			if _, err := trace.Emit(ctx, trace.EventLLMStarted, map[string]any{
@@ -128,6 +152,132 @@ func Node[S any](id string, spec NodeSpec[S]) graph.NodeSpec[S] {
 			return command, nil
 		},
 	}
+}
+
+func resolveMessages[S any](ctx context.Context, state S, spec NodeSpec[S]) ([]Message, error) {
+	if spec.PromptID != "" && spec.Messages.Read != nil {
+		return nil, errors.New("llm: PromptID and Messages.Read cannot both be set")
+	}
+	if spec.PromptID == "" {
+		if spec.Messages.Read == nil {
+			return nil, errors.New("llm: message reader is required")
+		}
+		return spec.Messages.Read(ctx, state)
+	}
+	registry, ok := lqprompt.RegistryFromContext(ctx)
+	if !ok {
+		return nil, errors.New("llm: prompt registry is required for PromptID")
+	}
+	data := map[string]any{}
+	if spec.Data != nil {
+		renderData, err := spec.Data(ctx, state)
+		if err != nil {
+			return nil, err
+		}
+		if renderData != nil {
+			data = renderData
+		}
+	}
+	rendered, err := registry.Render(ctx, spec.PromptID, data)
+	if err != nil {
+		return nil, err
+	}
+	messages := make([]Message, 0, len(rendered.Segments))
+	for _, segment := range rendered.Segments {
+		messages = append(messages, Message{
+			Role:    Role(segment.Role),
+			Content: segment.Content,
+		})
+	}
+	return messages, nil
+}
+
+func resolveToolSpecs[S any](ctx context.Context, spec NodeSpec[S]) ([]ToolSpec, error) {
+	if len(spec.Tools) > 0 && len(spec.ToolIDs) > 0 {
+		return nil, errors.New("llm: Tools and ToolIDs cannot both be set")
+	}
+	if len(spec.ToolIDs) == 0 {
+		return append([]ToolSpec(nil), spec.Tools...), nil
+	}
+	resolver, ok := ToolSpecResolverFromContext(ctx)
+	if !ok {
+		return nil, errors.New("llm: tool resolver is required for ToolIDs")
+	}
+	tools, err := resolver.LLMSpecs(spec.ToolIDs...)
+	if err != nil {
+		return nil, err
+	}
+	return append([]ToolSpec(nil), tools...), nil
+}
+
+func estimatePromptTokens[S any](ctx context.Context, spec NodeSpec[S], request Request) error {
+	estimator := spec.TokenEstimator
+	if estimator == nil {
+		if contextual, ok := lqtoken.EstimatorFromContext(ctx); ok {
+			estimator = contextual
+		}
+	}
+	if estimator == nil {
+		return nil
+	}
+	estimate, err := estimator.CountPromptTokens(ctx, lqtoken.EstimateRequest{
+		Provider:        request.Provider,
+		Model:           request.Model,
+		Messages:        toTokenMessages(request.Messages),
+		Tools:           toTokenTools(request.Tools),
+		MaxOutputTokens: request.MaxTokens,
+		ContextLimit:    spec.ContextLimit,
+		Metadata:        request.Metadata,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = trace.Emit(ctx, trace.EventPromptEstimated, estimate)
+	return err
+}
+
+func toTokenMessages(messages []Message) []lqtoken.Message {
+	result := make([]lqtoken.Message, 0, len(messages))
+	for _, message := range messages {
+		result = append(result, lqtoken.Message{
+			Role:       string(message.Role),
+			Content:    message.Content,
+			Name:       message.Name,
+			ToolCallID: message.ToolCallID,
+			ToolCalls:  toTokenToolCalls(message.ToolCalls),
+		})
+	}
+	return result
+}
+
+func toTokenToolCalls(calls []ToolCall) []lqtoken.ToolCall {
+	if len(calls) == 0 {
+		return nil
+	}
+	result := make([]lqtoken.ToolCall, 0, len(calls))
+	for _, call := range calls {
+		result = append(result, lqtoken.ToolCall{
+			ID:        call.ID,
+			Name:      call.Name,
+			Arguments: call.Arguments,
+		})
+	}
+	return result
+}
+
+func toTokenTools(tools []ToolSpec) []lqtoken.ToolSpec {
+	if len(tools) == 0 {
+		return nil
+	}
+	result := make([]lqtoken.ToolSpec, 0, len(tools))
+	for _, tool := range tools {
+		result = append(result, lqtoken.ToolSpec{
+			Name:        tool.Name,
+			Description: tool.Description,
+			InputSchema: tool.InputSchema,
+		})
+	}
+	return result
 }
 
 func cloneReasoningConfig(config *ReasoningConfig) *ReasoningConfig {

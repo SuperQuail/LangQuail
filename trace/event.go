@@ -19,6 +19,8 @@ const (
 	EventEdgeSelected     = "edge.selected"
 	EventCheckpointSaved  = "checkpoint.saved"
 	EventPromptRendered   = "prompt.rendered"
+	EventPromptEstimated  = "prompt.estimated"
+	EventPromptAdjusted   = "prompt.adjusted"
 	EventLLMStarted       = "llm.started"
 	EventLLMDelta         = "llm.delta"
 	EventLLMCompleted     = "llm.completed"

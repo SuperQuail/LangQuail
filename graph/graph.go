@@ -53,12 +53,20 @@ type fixedEdge struct {
 	to   string
 }
 
+type dynamicEdge struct {
+	from        string
+	to          string
+	label       string
+	description string
+}
+
 type StateGraph[S any] struct {
 	workflowID string
 	nodes      map[string]node[S]
 	nodeOrder  []string
 	fixed      map[string][]string
 	fixedOrder []fixedEdge
+	reachable  []dynamicEdge
 	routes     map[string]*route[S]
 	start      string
 	finish     map[string]struct{}
@@ -73,6 +81,12 @@ type RouteSelection struct {
 	Default bool
 }
 
+type Workflow interface {
+	WorkflowID() string
+	Snapshot() Snapshot
+	Validate() error
+}
+
 func NewStateGraph[S any](workflowID string) *StateGraph[S] {
 	return &StateGraph[S]{
 		workflowID: workflowID,
@@ -81,6 +95,38 @@ func NewStateGraph[S any](workflowID string) *StateGraph[S] {
 		routes:     make(map[string]*route[S]),
 		finish:     make(map[string]struct{}),
 	}
+}
+
+type ReachableOption func(*dynamicEdge)
+
+func EdgeLabel(label string) ReachableOption {
+	return func(edge *dynamicEdge) {
+		edge.label = label
+	}
+}
+
+func EdgeDescription(description string) ReachableOption {
+	return func(edge *dynamicEdge) {
+		edge.description = description
+	}
+}
+
+func (g *StateGraph[S]) Reachable(from string, to string, opts ...ReachableOption) *StateGraph[S] {
+	if g == nil {
+		return g
+	}
+	if from == "" || to == "" {
+		g.addError("graph: reachable endpoints cannot be empty")
+		return g
+	}
+	edge := dynamicEdge{from: from, to: to}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&edge)
+		}
+	}
+	g.reachable = append(g.reachable, edge)
+	return g
 }
 
 func (g *StateGraph[S]) WorkflowID() string {
@@ -213,6 +259,14 @@ func (g *StateGraph[S]) Validate() error {
 		}
 		if route.otherwise != "" && !g.HasNode(route.otherwise) {
 			errs = append(errs, fmt.Errorf("graph: otherwise target %q from %q is not registered", route.otherwise, from))
+		}
+	}
+	for _, edge := range g.reachable {
+		if !g.HasNode(edge.from) {
+			errs = append(errs, fmt.Errorf("graph: reachable source %q is not registered", edge.from))
+		}
+		if !g.HasNode(edge.to) {
+			errs = append(errs, fmt.Errorf("graph: reachable target %q from %q is not registered", edge.to, edge.from))
 		}
 	}
 	return errors.Join(errs...)

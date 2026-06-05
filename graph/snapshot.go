@@ -15,12 +15,13 @@ type NodeSnapshot struct {
 }
 
 type EdgeSnapshot struct {
-	From    string `json:"from"`
-	To      string `json:"to"`
-	Kind    string `json:"kind"`
-	Label   string `json:"label,omitempty"`
-	Order   int    `json:"order,omitempty"`
-	Default bool   `json:"default,omitempty"`
+	From        string `json:"from"`
+	To          string `json:"to"`
+	Kind        string `json:"kind"`
+	Label       string `json:"label,omitempty"`
+	Description string `json:"description,omitempty"`
+	Order       int    `json:"order,omitempty"`
+	Default     bool   `json:"default,omitempty"`
 }
 
 func (g *StateGraph[S]) Snapshot() Snapshot {
@@ -73,6 +74,15 @@ func (g *StateGraph[S]) Snapshot() Snapshot {
 				Default: true,
 			})
 		}
+	}
+	for _, edge := range g.reachable {
+		snapshot.Edges = append(snapshot.Edges, EdgeSnapshot{
+			From:        edge.from,
+			To:          edge.to,
+			Kind:        string(EdgeKindDynamic),
+			Label:       edge.label,
+			Description: edge.description,
+		})
 	}
 	return snapshot
 }

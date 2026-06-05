@@ -104,6 +104,48 @@ func TestToolNodeFailsOnUnknownTool(t *testing.T) {
 	}
 }
 
+func TestToolNodeUsesRegistryFromContext(t *testing.T) {
+	registry := tool.NewRegistry()
+	err := registry.Register(tool.Define[lookupInput, lookupOutput]("lookup").
+		Execute(func(ctx context.Context, input lookupInput) (lookupOutput, error) {
+			return lookupOutput{Answer: "found:" + input.Query}, nil
+		}))
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	g := graph.NewStateGraph[failureState]("tool.context")
+	g.Node(tool.Node("run_tool", tool.NodeSpec[failureState]{
+		ToolIDs: []string{"lookup"},
+		Calls: func(ctx context.Context, state failureState) ([]tool.Call, error) {
+			return state.Calls, nil
+		},
+		Output: func(ctx context.Context, state failureState, results []tool.Result) (graph.Command[failureState], error) {
+			state.Results = append(state.Results, results...)
+			return graph.Update(state), nil
+		},
+	}))
+	g.Start("run_tool")
+	g.Finish("run_tool")
+
+	runner, err := lqruntime.NewRunner(g)
+	if err != nil {
+		t.Fatalf("NewRunner() error = %v", err)
+	}
+	ctx := tool.WithRegistry(context.Background(), registry)
+	result, err := runner.Invoke(ctx, failureState{Calls: []tool.Call{{
+		ID:        "call_1",
+		Name:      "lookup",
+		Arguments: json.RawMessage(`{"query":"langquail"}`),
+	}}})
+	if err != nil {
+		t.Fatalf("Invoke() error = %v", err)
+	}
+	if len(result.State.Results) != 1 || result.State.Results[0].Content != `{"answer":"found:langquail"}` {
+		t.Fatalf("results = %#v", result.State.Results)
+	}
+}
+
 func TestToolNodeContinueOnErrorHandlesUnknownToolAndBadArguments(t *testing.T) {
 	executed := 0
 	registry := tool.NewRegistry()

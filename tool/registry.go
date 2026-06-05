@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/superquail/langquail/graph"
@@ -95,6 +96,7 @@ func (r *Registry) LLMSpecs(names ...string) ([]llm.ToolSpec, error) {
 
 type NodeSpec[S any] struct {
 	Registry        *Registry
+	ToolIDs         []string
 	Calls           func(context.Context, S) ([]Call, error)
 	Output          func(context.Context, S, []Result) (graph.Command[S], error)
 	Error           func(context.Context, S, Call, error) (graph.Command[S], error)
@@ -104,6 +106,9 @@ type NodeSpec[S any] struct {
 
 func Node[S any](id string, spec NodeSpec[S]) graph.NodeSpec[S] {
 	metadata := map[string]string{"node": "tool"}
+	if len(spec.ToolIDs) > 0 {
+		metadata["tool_ids"] = strings.Join(spec.ToolIDs, ",")
+	}
 	for key, value := range spec.Metadata {
 		metadata[key] = value
 	}
@@ -112,7 +117,11 @@ func Node[S any](id string, spec NodeSpec[S]) graph.NodeSpec[S] {
 		Kind:     graph.NodeKindTool,
 		Metadata: metadata,
 		Run: func(ctx context.Context, state S) (graph.Command[S], error) {
-			if spec.Registry == nil {
+			registry := spec.Registry
+			if registry == nil {
+				registry, _ = RegistryFromContext(ctx)
+			}
+			if registry == nil {
 				return graph.Noop[S](), errors.New("tool: registry is required")
 			}
 			if spec.Calls == nil {
@@ -124,7 +133,10 @@ func Node[S any](id string, spec NodeSpec[S]) graph.NodeSpec[S] {
 			}
 			results := make([]Result, 0, len(calls))
 			for _, call := range calls {
-				result, command, err := executeCall[S](ctx, spec.Registry, call)
+				if err := requireAllowedTool(call.Name, spec.ToolIDs); err != nil {
+					return graph.Noop[S](), err
+				}
+				result, command, err := executeCall[S](ctx, registry, call)
 				if err != nil {
 					if spec.Error != nil {
 						return spec.Error(ctx, state, call, err)
@@ -146,6 +158,38 @@ func Node[S any](id string, spec NodeSpec[S]) graph.NodeSpec[S] {
 			return spec.Output(ctx, state, results)
 		},
 	}
+}
+
+type registryContextKey struct{}
+
+func WithRegistry(ctx context.Context, registry *Registry) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if registry == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, registryContextKey{}, registry)
+}
+
+func RegistryFromContext(ctx context.Context) (*Registry, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	registry, ok := ctx.Value(registryContextKey{}).(*Registry)
+	return registry, ok && registry != nil
+}
+
+func requireAllowedTool(name string, allowed []string) error {
+	if len(allowed) == 0 {
+		return nil
+	}
+	for _, id := range allowed {
+		if id == name {
+			return nil
+		}
+	}
+	return fmt.Errorf("tool: tool %q is not allowed for this node", name)
 }
 
 func executeCall[S any](ctx context.Context, registry *Registry, call Call) (Result, graph.Command[S], error) {
