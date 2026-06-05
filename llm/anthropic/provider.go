@@ -1,6 +1,7 @@
 package anthropic
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -303,7 +304,7 @@ func convertResponseContent(blocks []sdkanthropic.ContentBlockUnion) (string, []
 			calls = append(calls, llm.ToolCall{
 				ID:        block.ID,
 				Name:      block.Name,
-				Arguments: append(json.RawMessage(nil), block.Input...),
+				Arguments: json.RawMessage(bytes.Clone(block.Input)),
 			})
 		}
 	}

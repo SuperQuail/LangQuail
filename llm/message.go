@@ -1,6 +1,9 @@
 package llm
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+)
 
 type Role string
 
@@ -51,7 +54,7 @@ func cloneToolCalls(calls []ToolCall) []ToolCall {
 	cloned := make([]ToolCall, len(calls))
 	for i, call := range calls {
 		cloned[i] = call
-		cloned[i].Arguments = append(json.RawMessage(nil), call.Arguments...)
+		cloned[i].Arguments = json.RawMessage(bytes.Clone(call.Arguments))
 	}
 	return cloned
 }

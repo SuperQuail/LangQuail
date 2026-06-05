@@ -9,6 +9,7 @@
 Thumbs.db
 
 # Go
+.gocache
 coverage.out
 coverage.html
 lqcover-*.out

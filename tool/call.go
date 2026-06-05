@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"bytes"
 	"encoding/json"
 
 	"github.com/superquail/langquail/llm"
@@ -18,7 +19,7 @@ func FromLLMToolCalls(calls []llm.ToolCall) []Call {
 		result = append(result, Call{
 			ID:        call.ID,
 			Name:      call.Name,
-			Arguments: append(json.RawMessage(nil), call.Arguments...),
+			Arguments: json.RawMessage(bytes.Clone(call.Arguments)),
 		})
 	}
 	return result

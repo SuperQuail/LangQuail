@@ -1,6 +1,7 @@
 package checkpoint
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"sync"
@@ -115,8 +116,5 @@ func cloneCheckpoint(checkpoint Checkpoint) Checkpoint {
 }
 
 func cloneRaw(raw []byte) []byte {
-	if raw == nil {
-		return nil
-	}
-	return append([]byte(nil), raw...)
+	return bytes.Clone(raw)
 }

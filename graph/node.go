@@ -1,5 +1,7 @@
 package graph
 
+import "maps"
+
 type NodeSpec[S any] struct {
 	ID       string
 	Kind     NodeKind
@@ -40,9 +42,5 @@ func cloneMetadata(metadata map[string]string) map[string]string {
 	if len(metadata) == 0 {
 		return nil
 	}
-	clone := make(map[string]string, len(metadata))
-	for key, value := range metadata {
-		clone[key] = value
-	}
-	return clone
+	return maps.Clone(metadata)
 }

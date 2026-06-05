@@ -161,6 +161,49 @@ func TestLLMPublicMessageAndProviderContracts(t *testing.T) {
 	if _, err := providers.Get("missing"); err == nil || !strings.Contains(err.Error(), "not registered") {
 		t.Fatalf("Get(missing) error = %v", err)
 	}
+
+	modelProviders, err := llm.NewProviderSet(llm.RegisterProvider(
+		contractProvider{name: "beta"},
+		llm.WithProviderName("Beta"),
+		llm.WithProviderEnv("BETA_API_KEY"),
+		llm.WithModels(llm.ModelInfo{
+			ID:           "contract-model",
+			Capabilities: llm.ModelCapabilities{Tools: true, Input: []string{"text"}, Output: []string{"text"}},
+			Limits:       llm.ModelLimits{Context: 128_000, Output: 4_096},
+		}),
+		llm.WithDefaultModel("contract-model"),
+	))
+	if err != nil {
+		t.Fatalf("NewProviderSet() error = %v", err)
+	}
+	info, err := modelProviders.ProviderInfo("beta")
+	if err != nil {
+		t.Fatalf("ProviderInfo(beta) error = %v", err)
+	}
+	if info.ID != "beta" || info.Name != "Beta" || info.Env[0] != "BETA_API_KEY" || info.DefaultModel != "contract-model" {
+		t.Fatalf("ProviderInfo(beta) = %#v", info)
+	}
+	model, err := modelProviders.DefaultModel("beta")
+	if err != nil {
+		t.Fatalf("DefaultModel(beta) error = %v", err)
+	}
+	if model.ID != "contract-model" || model.Provider != "beta" || !model.Capabilities.Tools {
+		t.Fatalf("DefaultModel(beta) = %#v", model)
+	}
+	refModel, err := modelProviders.Model("beta/contract-model")
+	if err != nil {
+		t.Fatalf("Model(beta/contract-model) error = %v", err)
+	}
+	if refModel.ID != "contract-model" || refModel.Provider != "beta" {
+		t.Fatalf("Model(beta/contract-model) = %#v", refModel)
+	}
+	ref, err := llm.ParseModelRef("beta/contract-model")
+	if err != nil {
+		t.Fatalf("ParseModelRef() error = %v", err)
+	}
+	if ref.String() != "beta/contract-model" {
+		t.Fatalf("ModelRef.String() = %q", ref.String())
+	}
 }
 
 func TestHITLPublicHelperContracts(t *testing.T) {

@@ -1,6 +1,7 @@
 package trace
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"sync"
@@ -81,8 +82,5 @@ func cloneEvent(event Event) Event {
 }
 
 func clonePayload(payload []byte) []byte {
-	if payload == nil {
-		return nil
-	}
-	return append([]byte(nil), payload...)
+	return bytes.Clone(payload)
 }

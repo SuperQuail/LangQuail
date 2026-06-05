@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -61,7 +62,7 @@ func (d *Definition[TIn, TOut]) Spec() Spec {
 	return Spec{
 		Name:        d.id,
 		Description: d.description,
-		InputSchema: append(json.RawMessage(nil), d.inputSchema...),
+		InputSchema: json.RawMessage(bytes.Clone(d.inputSchema)),
 	}
 }
 

@@ -79,9 +79,6 @@ func WithMetadata(metadata map[string]string) InvokeOption {
 		if len(metadata) == 0 {
 			return
 		}
-		config.metadata = make(map[string]string, len(metadata))
-		for key, value := range metadata {
-			config.metadata[key] = value
-		}
+		config.metadata = cloneMetadata(metadata)
 	}
 }
