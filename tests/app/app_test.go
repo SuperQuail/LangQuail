@@ -30,6 +30,12 @@ type lookupOutput struct {
 	Answer string `json:"answer"`
 }
 
+func TestVersion(t *testing.T) {
+	if lq.Version != "1.0.0-alpha.1" {
+		t.Fatalf("Version = %q, want %q", lq.Version, "1.0.0-alpha.1")
+	}
+}
+
 func TestAppBuilderRegistersComponentsAndContextRunsNodes(t *testing.T) {
 	promptDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(promptDir, "support"), 0o755); err != nil {

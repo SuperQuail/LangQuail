@@ -28,6 +28,15 @@ type InterruptRecord struct {
 	ResolvedAt   time.Time         `json:"resolved_at,omitempty"`
 }
 
+type ResumeRequest[S any] struct {
+	Run          Run           `json:"run"`
+	State        S             `json:"state"`
+	ResumeNode   string        `json:"resume_node"`
+	Response     hitl.Response `json:"response"`
+	InterruptID  string        `json:"interrupt_id,omitempty"`
+	CheckpointID string        `json:"checkpoint_id,omitempty"`
+}
+
 type interruptStore interface {
 	Save(context.Context, InterruptRecord) (InterruptRecord, error)
 	Load(context.Context, string) (InterruptRecord, error)
@@ -159,18 +168,69 @@ func (r *Runner[S]) Resume(ctx context.Context, interruptID string, response hit
 		ID:         record.RunID,
 		WorkflowID: record.WorkflowID,
 		SessionID:  record.SessionID,
-		Status:     StatusRunning,
 		Metadata:   cloneMetadata(record.Metadata),
-		StartedAt:  time.Now().UTC(),
 	}
-	return r.run(ctx, run, state, record.ResumeNode, traceStart{
+	resumeResponse := hitl.Response{}
+	if record.Response != nil {
+		resumeResponse = *record.Response
+	}
+	return r.ResumeFrom(ctx, ResumeRequest[S]{
+		Run:          run,
+		State:        state,
+		ResumeNode:   record.ResumeNode,
+		Response:     resumeResponse,
+		InterruptID:  record.ID,
+		CheckpointID: record.CheckpointID,
+	})
+}
+
+func (r *Runner[S]) ResumeFrom(ctx context.Context, request ResumeRequest[S]) (*Result[S], error) {
+	if r == nil {
+		return nil, errors.New("runtime: nil runner")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if request.Run.ID == "" {
+		return nil, errors.New("runtime: run id is required")
+	}
+	if request.Run.WorkflowID == "" {
+		return nil, errors.New("runtime: workflow id is required")
+	}
+	if request.Run.WorkflowID != r.graph.WorkflowID() {
+		return nil, errors.New("runtime: resume workflow does not match runner workflow")
+	}
+	if request.ResumeNode == "" {
+		return nil, errors.New("runtime: resume node is required")
+	}
+	if !r.graph.HasNode(request.ResumeNode) {
+		return nil, errors.New("runtime: resume node is not registered")
+	}
+	run := request.Run
+	run.Status = StatusRunning
+	run.StartedAt = time.Now().UTC()
+	run.CompletedAt = time.Time{}
+	run.Error = ""
+	run.Metadata = cloneMetadata(request.Run.Metadata)
+	response := request.Response
+	if response.InterruptID == "" && request.InterruptID != "" {
+		response.InterruptID = request.InterruptID
+	}
+	return r.run(ctx, run, request.State, request.ResumeNode, traceStart{
 		eventType: trace.EventRunResumed,
-		payload: map[string]any{
-			"interrupt_id":  record.ID,
-			"checkpoint_id": record.CheckpointID,
-			"resume_node":   record.ResumeNode,
-		},
-	}, record.Response)
+		payload:   resumePayload(request.ResumeNode, request.InterruptID, request.CheckpointID),
+	}, &response)
+}
+
+func resumePayload(resumeNode string, interruptID string, checkpointID string) map[string]any {
+	payload := map[string]any{"resume_node": resumeNode}
+	if interruptID != "" {
+		payload["interrupt_id"] = interruptID
+	}
+	if checkpointID != "" {
+		payload["checkpoint_id"] = checkpointID
+	}
+	return payload
 }
 
 type traceStart struct {

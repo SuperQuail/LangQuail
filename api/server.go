@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/superquail/langquail/graph"
 	"github.com/superquail/langquail/prompt"
+	lqruntime "github.com/superquail/langquail/runtime"
 	"github.com/superquail/langquail/trace"
 )
 
@@ -28,13 +30,32 @@ type Application interface {
 type ServeOption func(*serveConfig)
 
 type serveConfig struct {
-	configDir string
-	output    io.Writer
+	configDir           string
+	token               string
+	tokenFile           string
+	tokenSource         string
+	tokenSourceConflict bool
+	output              io.Writer
 }
 
 func WithConfigDir(path string) ServeOption {
 	return func(config *serveConfig) {
+		config.setTokenSource("config_dir")
 		config.configDir = path
+	}
+}
+
+func WithToken(token string) ServeOption {
+	return func(config *serveConfig) {
+		config.setTokenSource("token")
+		config.token = token
+	}
+}
+
+func WithTokenFile(path string) ServeOption {
+	return func(config *serveConfig) {
+		config.setTokenSource("token_file")
+		config.tokenFile = path
 	}
 }
 
@@ -42,6 +63,14 @@ func WithOutput(output io.Writer) ServeOption {
 	return func(config *serveConfig) {
 		config.output = output
 	}
+}
+
+func (config *serveConfig) setTokenSource(source string) {
+	if config.tokenSource != "" {
+		config.tokenSourceConflict = true
+		return
+	}
+	config.tokenSource = source
 }
 
 type Server struct {
@@ -62,7 +91,7 @@ func NewServer(app Application, opts ...ServeOption) (*Server, error) {
 			opt(&config)
 		}
 	}
-	token, tokenPath, err := loadOrCreateToken(config.configDir)
+	token, tokenPath, err := serverToken(config)
 	if err != nil {
 		return nil, err
 	}
@@ -105,10 +134,35 @@ func (s *Server) Serve(addr string) error {
 		addr = "127.0.0.1:0"
 	}
 	if s.output != nil {
-		fmt.Fprintf(s.output, "LangQuail server token file: %s\n", s.tokenPath)
+		if s.tokenPath != "" {
+			fmt.Fprintf(s.output, "LangQuail server token file: %s\n", s.tokenPath)
+		}
 		fmt.Fprintf(s.output, "LangQuail server token: %s\n", s.token)
 	}
 	return http.ListenAndServe(addr, s.Handler())
+}
+
+func serverToken(config serveConfig) (string, string, error) {
+	if config.tokenSourceConflict {
+		return "", "", errors.New("api: multiple token sources configured")
+	}
+	switch config.tokenSource {
+	case "":
+		token, err := generateToken()
+		return token, "", err
+	case "token":
+		token := strings.TrimSpace(config.token)
+		if token == "" {
+			return "", "", errors.New("api: token is required")
+		}
+		return token, "", nil
+	case "token_file":
+		return loadOrCreateTokenFile(config.tokenFile)
+	case "config_dir":
+		return loadOrCreateToken(config.configDir)
+	default:
+		return "", "", fmt.Errorf("api: unknown token source %q", config.tokenSource)
+	}
 }
 
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
@@ -144,6 +198,8 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handlePromptDraft(w, r, parts[1])
 	case r.Method == http.MethodPost && len(parts) == 3 && parts[0] == "runs" && parts[2] == "invoke":
 		s.handleInvoke(w, r, parts[1])
+	case r.Method == http.MethodPost && len(parts) == 3 && parts[0] == "runs" && parts[2] == "resume":
+		s.handleResume(w, r, parts[1])
 	default:
 		writeError(w, http.StatusNotFound, "not found")
 	}
@@ -261,7 +317,13 @@ func (s *Server) handleInvoke(w http.ResponseWriter, r *http.Request, workflowID
 		writeError(w, http.StatusBadRequest, "workflow is not HTTP executable")
 		return
 	}
+	defer r.Body.Close()
 	input, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	stateInput, invokeOptions, err := parseInvokeBody(input)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -271,14 +333,101 @@ func (s *Server) handleInvoke(w http.ResponseWriter, r *http.Request, workflowID
 		s.hub.Publish(event)
 		return nil
 	})
-	output, err := executable.InvokeJSON(ctx, input)
+	output, err := executable.InvokeJSON(ctx, stateInput, invokeOptions...)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	writeRawJSON(w, http.StatusOK, output)
+}
+
+func (s *Server) handleResume(w http.ResponseWriter, r *http.Request, workflowID string) {
+	workflow, exists := s.app.Workflow(workflowID)
+	if !exists {
+		writeError(w, http.StatusNotFound, "workflow not found")
+		return
+	}
+	executable, ok := workflow.(ExecutableWorkflow)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "workflow is not HTTP executable")
+		return
+	}
+	var request ResumeJSONRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ctx := s.app.Context(r.Context())
+	ctx = withInvokeEventHandler(ctx, func(_ context.Context, event trace.Event) error {
+		s.hub.Publish(event)
+		return nil
+	})
+	output, err := executable.ResumeJSON(ctx, request)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeRawJSON(w, http.StatusOK, output)
+}
+
+func parseInvokeBody(input []byte) (json.RawMessage, []lqruntime.InvokeOption, error) {
+	trimmed := bytes.TrimSpace(input)
+	if len(trimmed) == 0 {
+		return nil, nil, nil
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &fields); err != nil || !isInvokeEnvelope(fields) {
+		return json.RawMessage(input), nil, nil
+	}
+	var envelope invokeEnvelope
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&envelope); err != nil {
+		return nil, nil, err
+	}
+	options := make([]lqruntime.InvokeOption, 0, 4)
+	if envelope.RunID != "" {
+		options = append(options, lqruntime.WithRunID(envelope.RunID))
+	}
+	if envelope.SessionID != "" {
+		options = append(options, lqruntime.WithSession(envelope.SessionID))
+	}
+	if envelope.StartAt != "" {
+		options = append(options, lqruntime.WithStartAt(envelope.StartAt))
+	}
+	if len(envelope.Metadata) > 0 {
+		options = append(options, lqruntime.WithMetadata(envelope.Metadata))
+	}
+	return envelope.State, options, nil
+}
+
+func isInvokeEnvelope(fields map[string]json.RawMessage) bool {
+	if len(fields) == 0 {
+		return false
+	}
+	if _, exists := fields["state"]; !exists {
+		return false
+	}
+	for _, key := range []string{"run_id", "session_id", "metadata", "start_at"} {
+		if _, exists := fields[key]; exists {
+			return true
+		}
+	}
+	return false
+}
+
+type invokeEnvelope struct {
+	State     json.RawMessage   `json:"state"`
+	RunID     string            `json:"run_id,omitempty"`
+	SessionID string            `json:"session_id,omitempty"`
+	Metadata  map[string]string `json:"metadata,omitempty"`
+	StartAt   string            `json:"start_at,omitempty"`
+}
+
+func writeRawJSON(w http.ResponseWriter, status int, raw []byte) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(output)
+	w.WriteHeader(status)
+	_, _ = w.Write(raw)
 }
 
 func (s *Server) serveEventsWS(w http.ResponseWriter, r *http.Request) {

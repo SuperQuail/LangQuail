@@ -30,10 +30,25 @@ func loadOrCreateToken(configDir string) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
+	return loadOrCreateTokenPath(filepath.Join(dir, "server.json"))
+}
+
+func loadOrCreateTokenFile(path string) (string, string, error) {
+	if strings.TrimSpace(path) == "" {
+		return "", "", errors.New("api: token file path is required")
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", "", err
+	}
+	return loadOrCreateTokenPath(abs)
+}
+
+func loadOrCreateTokenPath(path string) (string, string, error) {
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", "", err
 	}
-	path := filepath.Join(dir, "server.json")
 	if _, err := os.Stat(path); err == nil {
 		token, err := readTokenFile(path)
 		return token, path, err

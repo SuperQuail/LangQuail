@@ -17,6 +17,8 @@ import (
 	lq "github.com/superquail/langquail"
 	"github.com/superquail/langquail/api"
 	"github.com/superquail/langquail/graph"
+	"github.com/superquail/langquail/hitl"
+	lqruntime "github.com/superquail/langquail/runtime"
 	"github.com/superquail/langquail/trace"
 )
 
@@ -24,37 +26,83 @@ type serverState struct {
 	Value string `json:"value"`
 }
 
+type resumeServerState struct {
+	Value string   `json:"value"`
+	Path  []string `json:"path,omitempty"`
+}
+
 func TestServerTokenLifecycle(t *testing.T) {
 	app := buildServerTestApp(t, false, "")
-	configDir := t.TempDir()
 
+	envDir := t.TempDir()
+	t.Setenv(api.ConfigDirEnv, envDir)
+	defaultServer, err := app.Server(api.WithOutput(io.Discard))
+	if err != nil {
+		t.Fatalf("Server(default) error = %v", err)
+	}
+	if !strings.HasPrefix(defaultServer.Token(), "lq_") {
+		t.Fatalf("default token = %q", defaultServer.Token())
+	}
+	if defaultServer.TokenPath() != "" {
+		t.Fatalf("default token path = %q, want empty", defaultServer.TokenPath())
+	}
+	if _, err := os.Stat(filepath.Join(envDir, "server.json")); !os.IsNotExist(err) {
+		t.Fatalf("default server.json stat error = %v, want not exist", err)
+	}
+
+	callerToken, err := app.Server(api.WithToken("caller-token"), api.WithOutput(io.Discard))
+	if err != nil {
+		t.Fatalf("Server(token) error = %v", err)
+	}
+	if callerToken.Token() != "caller-token" || callerToken.TokenPath() != "" {
+		t.Fatalf("caller token=%q path=%q", callerToken.Token(), callerToken.TokenPath())
+	}
+	if _, err := app.Server(api.WithToken(" "), api.WithOutput(io.Discard)); err == nil {
+		t.Fatal("Server(empty token) error is nil")
+	}
+
+	configDir := t.TempDir()
 	first, err := app.Server(api.WithConfigDir(configDir), api.WithOutput(io.Discard))
 	if err != nil {
-		t.Fatalf("Server(first) error = %v", err)
+		t.Fatalf("Server(first config) error = %v", err)
 	}
 	if !strings.HasPrefix(first.Token(), "lq_") {
-		t.Fatalf("token = %q", first.Token())
+		t.Fatalf("config token = %q", first.Token())
 	}
 	if _, err := os.Stat(filepath.Join(configDir, "server.json")); err != nil {
-		t.Fatalf("server.json stat error = %v", err)
+		t.Fatalf("config server.json stat error = %v", err)
 	}
 
 	second, err := app.Server(api.WithConfigDir(configDir), api.WithOutput(io.Discard))
 	if err != nil {
-		t.Fatalf("Server(second) error = %v", err)
+		t.Fatalf("Server(second config) error = %v", err)
 	}
 	if second.Token() != first.Token() {
 		t.Fatalf("token was not reused: first=%q second=%q", first.Token(), second.Token())
 	}
 
-	envDir := t.TempDir()
-	t.Setenv(api.ConfigDirEnv, envDir)
-	envServer, err := app.Server(api.WithOutput(io.Discard))
+	envServer, err := app.Server(api.WithConfigDir(""), api.WithOutput(io.Discard))
 	if err != nil {
 		t.Fatalf("Server(env) error = %v", err)
 	}
 	if !strings.HasPrefix(envServer.TokenPath(), envDir) {
 		t.Fatalf("env token path = %q, want under %q", envServer.TokenPath(), envDir)
+	}
+
+	tokenFile := filepath.Join(t.TempDir(), "custom-token.json")
+	fileServer, err := app.Server(api.WithTokenFile(tokenFile), api.WithOutput(io.Discard))
+	if err != nil {
+		t.Fatalf("Server(token file) error = %v", err)
+	}
+	if fileServer.TokenPath() != tokenFile {
+		t.Fatalf("token file path = %q, want %q", fileServer.TokenPath(), tokenFile)
+	}
+	fileServerAgain, err := app.Server(api.WithTokenFile(tokenFile), api.WithOutput(io.Discard))
+	if err != nil {
+		t.Fatalf("Server(token file again) error = %v", err)
+	}
+	if fileServerAgain.Token() != fileServer.Token() {
+		t.Fatalf("token file was not reused: first=%q second=%q", fileServer.Token(), fileServerAgain.Token())
 	}
 
 	invalidDir := t.TempDir()
@@ -63,6 +111,9 @@ func TestServerTokenLifecycle(t *testing.T) {
 	}
 	if _, err := app.Server(api.WithConfigDir(invalidDir), api.WithOutput(io.Discard)); err == nil {
 		t.Fatal("Server(invalid) error is nil")
+	}
+	if _, err := app.Server(api.WithToken("caller-token"), api.WithConfigDir(t.TempDir()), api.WithOutput(io.Discard)); err == nil {
+		t.Fatal("Server(multiple token sources) error is nil")
 	}
 }
 
@@ -165,6 +216,72 @@ func TestServerInvokeExecutableWorkflowAndRejectsPlainWorkflow(t *testing.T) {
 			t.Fatalf("result event context = %#v, want nil", event.Context)
 		}
 	}
+
+	req, err = http.NewRequest(http.MethodPost, execHTTP.URL+"/runs/server.workflow/invoke", strings.NewReader(`{"state":{"value":"env"},"run_id":"run_http","session_id":"session_http","metadata":{"tenant":"acme"},"start_at":"start"}`))
+	if err != nil {
+		t.Fatalf("NewRequest(envelope invoke) error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+execServer.Token())
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do(envelope invoke) error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("envelope invoke status = %d body=%s", resp.StatusCode, body)
+	}
+	var envelopeResult struct {
+		Run   lqruntime.Run `json:"run"`
+		State serverState   `json:"state"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelopeResult); err != nil {
+		t.Fatalf("decode envelope invoke: %v", err)
+	}
+	if envelopeResult.Run.ID != "run_http" || envelopeResult.Run.SessionID != "session_http" || envelopeResult.Run.Metadata["tenant"] != "acme" {
+		t.Fatalf("envelope run = %#v", envelopeResult.Run)
+	}
+	if envelopeResult.State.Value != "env!" {
+		t.Fatalf("envelope state = %#v", envelopeResult.State)
+	}
+
+	req, err = http.NewRequest(http.MethodPost, execHTTP.URL+"/runs/server.workflow/invoke", strings.NewReader(`{"state":{"value":"bad"},"run_id":"run_bad","unexpected":true}`))
+	if err != nil {
+		t.Fatalf("NewRequest(bad envelope) error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+execServer.Token())
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do(bad envelope) error = %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad envelope status = %d", resp.StatusCode)
+	}
+
+	req, err = http.NewRequest(http.MethodPost, execHTTP.URL+"/runs/server.workflow/invoke", strings.NewReader(`{"state":{"value":"nested"},"value":"raw"}`))
+	if err != nil {
+		t.Fatalf("NewRequest(raw state field) error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+execServer.Token())
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do(raw state field) error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("raw state field status = %d body=%s", resp.StatusCode, body)
+	}
+	var rawStateResult struct {
+		State serverState `json:"state"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rawStateResult); err != nil {
+		t.Fatalf("decode raw state field: %v", err)
+	}
+	if rawStateResult.State.Value != "raw!" {
+		t.Fatalf("raw state field result = %#v", rawStateResult.State)
+	}
 }
 
 func TestServerWebSocketReceivesLiveEventContext(t *testing.T) {
@@ -234,6 +351,98 @@ func TestServerWebSocketReceivesLiveEventContext(t *testing.T) {
 	}
 }
 
+func TestServerResumeUsesCallerProvidedState(t *testing.T) {
+	app := buildResumeServerTestApp(t)
+	firstServer, err := app.Server(api.WithOutput(io.Discard))
+	if err != nil {
+		t.Fatalf("first Server() error = %v", err)
+	}
+	firstHTTP := httptest.NewServer(firstServer.Handler())
+	defer firstHTTP.Close()
+
+	req, err := http.NewRequest(http.MethodPost, firstHTTP.URL+"/runs/server.resume/invoke", strings.NewReader(`{"value":"start"}`))
+	if err != nil {
+		t.Fatalf("NewRequest(invoke) error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+firstServer.Token())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do(invoke) error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("invoke status = %d body=%s", resp.StatusCode, body)
+	}
+	var interrupted struct {
+		Run   lqruntime.Run     `json:"run"`
+		State resumeServerState `json:"state"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&interrupted); err != nil {
+		t.Fatalf("decode interrupted result: %v", err)
+	}
+	if interrupted.Run.Status != lqruntime.StatusInterrupted {
+		t.Fatalf("interrupted run = %#v", interrupted.Run)
+	}
+	if interrupted.State.Value != "start:prepared" {
+		t.Fatalf("interrupted state = %#v", interrupted.State)
+	}
+
+	secondServer, err := app.Server(api.WithOutput(io.Discard))
+	if err != nil {
+		t.Fatalf("second Server() error = %v", err)
+	}
+	secondHTTP := httptest.NewServer(secondServer.Handler())
+	defer secondHTTP.Close()
+	resumeBody, err := json.Marshal(map[string]any{
+		"run":           interrupted.Run,
+		"state":         interrupted.State,
+		"resume_node":   "human",
+		"response":      hitl.Provide("yes"),
+		"interrupt_id":  "int_http",
+		"checkpoint_id": "chk_http",
+	})
+	if err != nil {
+		t.Fatalf("Marshal(resume) error = %v", err)
+	}
+	req, err = http.NewRequest(http.MethodPost, secondHTTP.URL+"/runs/server.resume/resume", bytes.NewReader(resumeBody))
+	if err != nil {
+		t.Fatalf("NewRequest(resume) error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+secondServer.Token())
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do(resume) error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("resume status = %d body=%s", resp.StatusCode, body)
+	}
+	var resumed struct {
+		Run    lqruntime.Run     `json:"run"`
+		State  resumeServerState `json:"state"`
+		Events []trace.Event     `json:"events"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&resumed); err != nil {
+		t.Fatalf("decode resumed result: %v", err)
+	}
+	if resumed.Run.Status != lqruntime.StatusCompleted || resumed.Run.ID != interrupted.Run.ID {
+		t.Fatalf("resumed run = %#v interrupted = %#v", resumed.Run, interrupted.Run)
+	}
+	if resumed.State.Value != "start:prepared:yes" {
+		t.Fatalf("resumed state = %#v", resumed.State)
+	}
+	event := requireAPIEvent(t, resumed.Events, trace.EventRunResumed)
+	var payload map[string]string
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		t.Fatalf("decode run.resumed payload: %v", err)
+	}
+	if payload["interrupt_id"] != "int_http" || payload["checkpoint_id"] != "chk_http" || payload["resume_node"] != "human" {
+		t.Fatalf("run.resumed payload = %#v", payload)
+	}
+}
+
 func buildServerTestApp(t *testing.T, executable bool, promptDir string) *lq.App {
 	t.Helper()
 	g := graph.NewStateGraph[serverState]("server.workflow")
@@ -258,6 +467,50 @@ func buildServerTestApp(t *testing.T, executable bool, promptDir string) *lq.App
 		t.Fatalf("Build() error = %v", err)
 	}
 	return app
+}
+
+func buildResumeServerTestApp(t *testing.T) *lq.App {
+	t.Helper()
+	g := graph.NewStateGraph[resumeServerState]("server.resume")
+	g.Step("prepare", func(ctx context.Context, state resumeServerState) (graph.Command[resumeServerState], error) {
+		state.Value += ":prepared"
+		state.Path = append(state.Path, "prepared")
+		return graph.Update(state), nil
+	})
+	g.Node(hitl.Node("human", hitl.NodeSpec[resumeServerState]{
+		Request: func(ctx context.Context, state resumeServerState) (hitl.Request, error) {
+			return hitl.NewRequest(hitl.RequestKindHumanInput, "need input", nil), nil
+		},
+		Output: func(ctx context.Context, state resumeServerState, response hitl.Response) (graph.Command[resumeServerState], error) {
+			answer, err := hitl.DecodePayload[string](response)
+			if err != nil {
+				return graph.Noop[resumeServerState](), err
+			}
+			state.Value += ":" + answer
+			state.Path = append(state.Path, "human")
+			return graph.Update(state), nil
+		},
+	}))
+	g.Flow("prepare", "human")
+	g.Start("prepare")
+	g.Finish("human")
+
+	app, err := lq.New("server-project").Workflows(lq.Executable(g)).Build()
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	return app
+}
+
+func requireAPIEvent(t *testing.T, events []trace.Event, eventType string) trace.Event {
+	t.Helper()
+	for _, event := range events {
+		if event.Type == eventType {
+			return event
+		}
+	}
+	t.Fatalf("event %s not found in %#v", eventType, events)
+	return trace.Event{}
 }
 
 func statusCode(t *testing.T, method string, url string, authorization string, body io.Reader) int {

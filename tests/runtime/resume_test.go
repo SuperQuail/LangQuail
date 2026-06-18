@@ -133,6 +133,66 @@ func TestResumeRestoresCheckpointStateRunIdentitySessionAndMetadata(t *testing.T
 	}
 }
 
+func TestResumeFromUsesCallerProvidedState(t *testing.T) {
+	g := graph.NewStateGraph[runtimeState]("runtime.resume.from")
+	g.Node(hitl.Node("human", hitl.NodeSpec[runtimeState]{
+		Request: func(ctx context.Context, state runtimeState) (hitl.Request, error) {
+			return hitl.NewRequest(hitl.RequestKindHumanInput, "need input", nil), nil
+		},
+		Output: func(ctx context.Context, state runtimeState, response hitl.Response) (graph.Command[runtimeState], error) {
+			answer, err := hitl.DecodePayload[string](response)
+			if err != nil {
+				return graph.Noop[runtimeState](), err
+			}
+			state.Path = append(state.Path, "resumed:"+answer)
+			return graph.Update(state), nil
+		},
+	}))
+	g.Start("human")
+	g.Finish("human")
+
+	runner, err := lqruntime.NewRunner(g)
+	if err != nil {
+		t.Fatalf("NewRunner() error = %v", err)
+	}
+	result, err := runner.ResumeFrom(context.Background(), lqruntime.ResumeRequest[runtimeState]{
+		Run: lqruntime.Run{
+			ID:         "run_saved",
+			WorkflowID: "runtime.resume.from",
+			SessionID:  "session_saved",
+			Metadata:   map[string]string{"tenant": "acme"},
+		},
+		State:        runtimeState{Count: 7, Path: []string{"saved"}},
+		ResumeNode:   "human",
+		Response:     hitl.Provide("yes"),
+		InterruptID:  "int_saved",
+		CheckpointID: "chk_saved",
+	})
+	if err != nil {
+		t.Fatalf("ResumeFrom() error = %v", err)
+	}
+	if result.Run.Status != lqruntime.StatusCompleted || result.Run.ID != "run_saved" || result.Run.SessionID != "session_saved" {
+		t.Fatalf("run = %#v", result.Run)
+	}
+	if result.Run.Metadata["tenant"] != "acme" {
+		t.Fatalf("metadata = %#v", result.Run.Metadata)
+	}
+	if result.State.Count != 7 || !reflect.DeepEqual(result.State.Path, []string{"saved", "resumed:yes"}) {
+		t.Fatalf("state = %#v", result.State)
+	}
+	if len(result.Checkpoints) != 1 {
+		t.Fatalf("checkpoints = %#v", result.Checkpoints)
+	}
+	event := runResumedEvent(t, result.Events)
+	var payload map[string]string
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		t.Fatalf("decode run.resumed payload: %v", err)
+	}
+	if payload["interrupt_id"] != "int_saved" || payload["checkpoint_id"] != "chk_saved" || payload["resume_node"] != "human" {
+		t.Fatalf("run.resumed payload = %#v", payload)
+	}
+}
+
 func runResumedEvent(t *testing.T, events []trace.Event) trace.Event {
 	t.Helper()
 	for _, event := range events {
