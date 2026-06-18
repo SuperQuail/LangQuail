@@ -78,6 +78,7 @@ func (r *MemoryRecorder) List(_ context.Context, runID string, afterSequence int
 
 func cloneEvent(event Event) Event {
 	event.Payload = clonePayload(event.Payload)
+	event.Context = nil
 	return event
 }
 

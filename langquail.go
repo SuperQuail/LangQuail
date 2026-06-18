@@ -1,6 +1,7 @@
 package langquail
 
 import (
+	"github.com/superquail/langquail/api"
 	"github.com/superquail/langquail/graph"
 	"github.com/superquail/langquail/runtime"
 	"github.com/superquail/langquail/tool"
@@ -28,6 +29,10 @@ func Noop[S any]() graph.Command[S] {
 
 func NewRunner[S any](stateGraph *graph.StateGraph[S], opts ...runtime.Option[S]) (*runtime.Runner[S], error) {
 	return runtime.NewRunner(stateGraph, opts...)
+}
+
+func Executable[S any](stateGraph *graph.StateGraph[S], opts ...runtime.Option[S]) api.ExecutableWorkflow {
+	return api.Executable(stateGraph, opts...)
 }
 
 func NewToolRegistry() *tool.Registry {

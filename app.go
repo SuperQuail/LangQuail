@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 
+	"github.com/superquail/langquail/api"
 	"github.com/superquail/langquail/graph"
 	"github.com/superquail/langquail/llm"
 	"github.com/superquail/langquail/prompt"
@@ -258,4 +260,24 @@ func (a *App) Context(ctx context.Context) context.Context {
 		ctx = prompt.WithRegistry(ctx, a.prompts)
 	}
 	return ctx
+}
+
+func (a *App) Server(opts ...api.ServeOption) (*api.Server, error) {
+	return api.NewServer(a, opts...)
+}
+
+func (a *App) Handler(opts ...api.ServeOption) (http.Handler, error) {
+	server, err := a.Server(opts...)
+	if err != nil {
+		return nil, err
+	}
+	return server.Handler(), nil
+}
+
+func (a *App) Serve(addr string, opts ...api.ServeOption) error {
+	server, err := a.Server(opts...)
+	if err != nil {
+		return err
+	}
+	return server.Serve(addr)
 }

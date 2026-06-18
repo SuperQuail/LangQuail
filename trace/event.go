@@ -36,6 +36,7 @@ const (
 type EmitFunc func(context.Context, string, any) (Event, error)
 
 type emitterContextKey struct{}
+type eventContextKey struct{}
 
 func WithEmitter(ctx context.Context, emit EmitFunc) context.Context {
 	if ctx == nil {
@@ -58,6 +59,24 @@ func Emit(ctx context.Context, eventType string, payload any) (Event, error) {
 	return emit(ctx, eventType, payload)
 }
 
+func WithEventContext(ctx context.Context, eventContext *EventContext) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if eventContext == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, eventContextKey{}, eventContext)
+}
+
+func EventContextFromContext(ctx context.Context) (*EventContext, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	eventContext, ok := ctx.Value(eventContextKey{}).(*EventContext)
+	return eventContext, ok && eventContext != nil
+}
+
 type Event struct {
 	ID         string          `json:"id"`
 	Type       string          `json:"type"`
@@ -70,6 +89,27 @@ type Event struct {
 	Sequence   int64           `json:"sequence"`
 	Time       time.Time       `json:"time"`
 	Payload    json.RawMessage `json:"payload,omitempty"`
+	Context    *EventContext   `json:"context,omitempty"`
+}
+
+type EventContext struct {
+	Current ContextSnapshot `json:"current"`
+	Change  *ContextChange  `json:"change,omitempty"`
+}
+
+type ContextSnapshot struct {
+	State      json.RawMessage `json:"state,omitempty"`
+	Messages   json.RawMessage `json:"messages,omitempty"`
+	Prompt     json.RawMessage `json:"prompt,omitempty"`
+	LLMRequest json.RawMessage `json:"llm_request,omitempty"`
+	ToolCall   json.RawMessage `json:"tool_call,omitempty"`
+	ToolResult json.RawMessage `json:"tool_result,omitempty"`
+}
+
+type ContextChange struct {
+	Before json.RawMessage `json:"before,omitempty"`
+	After  json.RawMessage `json:"after,omitempty"`
+	Ops    json.RawMessage `json:"ops,omitempty"`
 }
 
 func Payload(value any) json.RawMessage {

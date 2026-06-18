@@ -1,7 +1,9 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -15,13 +17,14 @@ import (
 )
 
 type Runner[S any] struct {
-	graph       *graph.StateGraph[S]
-	recorder    trace.Recorder
-	checkpoints checkpoint.Store
-	serializer  checkpoint.Serializer[S]
-	interrupts  interruptStore
-	onEvent     EventHandler
-	maxSteps    int
+	graph        *graph.StateGraph[S]
+	recorder     trace.Recorder
+	checkpoints  checkpoint.Store
+	serializer   checkpoint.Serializer[S]
+	interrupts   interruptStore
+	onEvent      EventHandler
+	eventContext EventContextOptions
+	maxSteps     int
 }
 
 const DefaultMaxSteps = 10000
@@ -106,7 +109,11 @@ func (r *Runner[S]) run(ctx context.Context, run Run, initialState S, startAt st
 	events := make([]trace.Event, 0, 16)
 
 	run.Status = StatusRunning
-	if _, err := r.record(ctx, &events, run, "", start.eventType, start.payload); err != nil {
+	startRaw, err := r.stateSnapshot(state)
+	if err != nil {
+		return r.result(run, state, events), err
+	}
+	if _, err := r.record(ctx, &events, run, "", start.eventType, start.payload, r.contextWithState(startRaw)); err != nil {
 		return r.result(run, state, events), err
 	}
 
@@ -114,26 +121,30 @@ func (r *Runner[S]) run(ctx context.Context, run Run, initialState S, startAt st
 	steps := 0
 	for {
 		if err := ctx.Err(); err != nil {
-			return r.cancel(run, state, events, current, err)
+			return r.cancel(context.Background(), run, state, events, current, err)
 		}
 		if r.maxSteps > 0 {
 			steps++
 			if steps > r.maxSteps {
-				return r.fail(run, state, events, current, fmt.Errorf("runtime: max steps exceeded: %d", r.maxSteps))
+				return r.fail(ctx, run, state, events, current, fmt.Errorf("runtime: max steps exceeded: %d", r.maxSteps))
 			}
 		}
 
 		nodeFunc, exists := r.graph.NodeFunc(current)
 		if !exists {
-			return r.fail(run, state, events, current, fmt.Errorf("runtime: node %q is not registered", current))
+			return r.fail(ctx, run, state, events, current, fmt.Errorf("runtime: node %q is not registered", current))
 		}
 
-		if _, err := r.record(ctx, &events, run, current, trace.EventNodeStarted, nil); err != nil {
+		nodeInputRaw, err := r.stateSnapshot(state)
+		if err != nil {
+			return r.result(run, state, events), err
+		}
+		if _, err := r.record(ctx, &events, run, current, trace.EventNodeStarted, nil, r.contextWithState(nodeInputRaw)); err != nil {
 			return r.result(run, state, events), err
 		}
 
 		nodeCtx := trace.WithEmitter(ctx, func(emitCtx context.Context, eventType string, payload any) (trace.Event, error) {
-			return r.record(emitCtx, &events, run, current, eventType, payload)
+			return r.record(emitCtx, &events, run, current, eventType, payload, r.contextForNodeEvent(emitCtx, eventType, payload, nodeInputRaw))
 		})
 		if resumeResponse != nil {
 			nodeCtx = hitl.WithResponse(nodeCtx, *resumeResponse)
@@ -143,66 +154,70 @@ func (r *Runner[S]) run(ctx context.Context, run Run, initialState S, startAt st
 		command, err := nodeFunc(nodeCtx, state)
 		if err != nil {
 			if cancelErr := cancellationCause(ctx, err); cancelErr != nil {
-				return r.cancel(run, state, events, current, cancelErr)
+				return r.cancel(context.Background(), run, state, events, current, cancelErr)
 			}
 			_, _ = r.record(context.Background(), &events, run, current, trace.EventNodeFailed, map[string]any{
 				"error": err.Error(),
-			})
-			return r.fail(run, state, events, current, err)
+			}, r.contextWithState(nodeInputRaw))
+			return r.fail(context.Background(), run, state, events, current, err)
 		}
 		if command.Update != nil {
 			state = *command.Update
 		}
 
-		completed, err := r.record(ctx, &events, run, current, trace.EventNodeCompleted, nil)
+		nodeOutputRaw, err := r.stateSnapshot(state)
+		if err != nil {
+			return r.result(run, state, events), err
+		}
+		completed, err := r.record(ctx, &events, run, current, trace.EventNodeCompleted, nil, r.contextWithStateChange(nodeInputRaw, nodeOutputRaw))
 		if err != nil {
 			return r.result(run, state, events), err
 		}
 		saved, err := r.saveCheckpoint(ctx, run, current, completed.Sequence, state)
 		if err != nil {
-			return r.fail(run, state, events, current, err)
+			return r.fail(ctx, run, state, events, current, err)
 		}
 		if _, err := r.record(ctx, &events, run, current, trace.EventCheckpointSaved, map[string]any{
 			"checkpoint_id": saved.ID,
 			"sequence":      saved.Sequence,
-		}); err != nil {
+		}, r.contextWithState(saved.State)); err != nil {
 			return r.result(run, state, events), err
 		}
 
 		if command.Interrupt != nil {
 			record, err := r.registerInterrupt(ctx, run, current, saved, command.Interrupt)
 			if err != nil {
-				return r.fail(run, state, events, current, err)
+				return r.fail(ctx, run, state, events, current, err)
 			}
-			_, _ = r.record(context.Background(), &events, run, current, trace.EventInterruptCreated, record.Request)
-			return r.interrupt(run, state, events, current, record)
+			_, _ = r.record(context.Background(), &events, run, current, trace.EventInterruptCreated, record.Request, r.contextWithState(nodeOutputRaw))
+			return r.interrupt(context.Background(), run, state, events, current, record)
 		}
 
 		// 路由优先级：Command.End > Command.Goto > Finish 节点 > 条件路由 > 固定边。
 		if command.End {
-			return r.complete(run, state, events, current)
+			return r.complete(ctx, run, state, events, current)
 		}
 		if command.Goto != "" {
 			if !r.graph.HasNode(command.Goto) {
-				return r.fail(run, state, events, current, fmt.Errorf("runtime: goto target %q is not registered", command.Goto))
+				return r.fail(ctx, run, state, events, current, fmt.Errorf("runtime: goto target %q is not registered", command.Goto))
 			}
 			if _, err := r.record(ctx, &events, run, current, trace.EventEdgeSelected, map[string]any{
 				"from": current,
 				"to":   command.Goto,
 				"kind": string(graph.EdgeKindDynamic),
-			}); err != nil {
+			}, r.contextWithState(nodeOutputRaw)); err != nil {
 				return r.result(run, state, events), err
 			}
 			current = command.Goto
 			continue
 		}
 		if r.graph.IsFinish(current) {
-			return r.complete(run, state, events, current)
+			return r.complete(ctx, run, state, events, current)
 		}
 
 		selection, selected, err := r.graph.SelectRoute(ctx, current, state)
 		if err != nil {
-			return r.fail(run, state, events, current, err)
+			return r.fail(ctx, run, state, events, current, err)
 		}
 		if selected {
 			if _, err := r.record(ctx, &events, run, current, trace.EventEdgeSelected, map[string]any{
@@ -211,7 +226,7 @@ func (r *Runner[S]) run(ctx context.Context, run Run, initialState S, startAt st
 				"kind":    string(selection.Kind),
 				"order":   selection.Order,
 				"default": selection.Default,
-			}); err != nil {
+			}, r.contextWithState(nodeOutputRaw)); err != nil {
 				return r.result(run, state, events), err
 			}
 			current = selection.Target
@@ -221,37 +236,46 @@ func (r *Runner[S]) run(ctx context.Context, run Run, initialState S, startAt st
 		targets := r.graph.FixedTargets(current)
 		switch len(targets) {
 		case 0:
-			return r.fail(run, state, events, current, fmt.Errorf("runtime: node %q has no route to continue", current))
+			return r.fail(ctx, run, state, events, current, fmt.Errorf("runtime: node %q has no route to continue", current))
 		case 1:
 			if _, err := r.record(ctx, &events, run, current, trace.EventEdgeSelected, map[string]any{
 				"from": current,
 				"to":   targets[0],
 				"kind": string(graph.EdgeKindFixed),
-			}); err != nil {
+			}, r.contextWithState(nodeOutputRaw)); err != nil {
 				return r.result(run, state, events), err
 			}
 			current = targets[0]
 		default:
-			return r.fail(run, state, events, current, fmt.Errorf("runtime: node %q has multiple fixed edges", current))
+			return r.fail(ctx, run, state, events, current, fmt.Errorf("runtime: node %q has multiple fixed edges", current))
 		}
 	}
 }
 
-func (r *Runner[S]) record(ctx context.Context, events *[]trace.Event, run Run, nodeID string, eventType string, payload any) (trace.Event, error) {
+func (r *Runner[S]) record(ctx context.Context, events *[]trace.Event, run Run, nodeID string, eventType string, payload any, eventContext *trace.EventContext) (trace.Event, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	payloadRaw := trace.Payload(payload)
 	event, err := r.recorder.Record(ctx, trace.Event{
 		Type:       eventType,
 		WorkflowID: run.WorkflowID,
 		SessionID:  run.SessionID,
 		RunID:      run.ID,
 		NodeID:     nodeID,
-		Payload:    trace.Payload(payload),
+		Payload:    payloadRaw,
 	})
 	if err != nil {
 		return trace.Event{}, err
 	}
+	event.Context = nil
 	*events = append(*events, event)
 	if r.onEvent != nil {
-		if err := r.onEvent(ctx, event); err != nil {
+		liveEvent := event
+		if r.eventContext.Enabled {
+			liveEvent.Context = cloneEventContext(eventContext)
+		}
+		if err := r.onEvent(ctx, liveEvent); err != nil {
 			return trace.Event{}, err
 		}
 	}
@@ -273,37 +297,37 @@ func (r *Runner[S]) saveCheckpoint(ctx context.Context, run Run, nodeID string, 
 	})
 }
 
-func (r *Runner[S]) complete(run Run, state S, events []trace.Event, nodeID string) (*Result[S], error) {
+func (r *Runner[S]) complete(ctx context.Context, run Run, state S, events []trace.Event, nodeID string) (*Result[S], error) {
 	run.Status = StatusCompleted
 	run.CompletedAt = time.Now().UTC()
-	_, _ = r.record(context.Background(), &events, run, nodeID, trace.EventRunCompleted, nil)
+	_, _ = r.record(ctx, &events, run, nodeID, trace.EventRunCompleted, nil, r.contextForStateValue(state))
 	return r.result(run, state, events), nil
 }
 
-func (r *Runner[S]) fail(run Run, state S, events []trace.Event, nodeID string, cause error) (*Result[S], error) {
+func (r *Runner[S]) fail(ctx context.Context, run Run, state S, events []trace.Event, nodeID string, cause error) (*Result[S], error) {
 	run.Status = StatusFailed
 	run.Error = cause.Error()
 	run.CompletedAt = time.Now().UTC()
-	_, _ = r.record(context.Background(), &events, run, nodeID, trace.EventRunFailed, map[string]any{
+	_, _ = r.record(ctx, &events, run, nodeID, trace.EventRunFailed, map[string]any{
 		"error": cause.Error(),
-	})
+	}, r.contextForStateValue(state))
 	return r.result(run, state, events), cause
 }
 
-func (r *Runner[S]) cancel(run Run, state S, events []trace.Event, nodeID string, cause error) (*Result[S], error) {
+func (r *Runner[S]) cancel(ctx context.Context, run Run, state S, events []trace.Event, nodeID string, cause error) (*Result[S], error) {
 	run.Status = StatusCancelled
 	run.Error = cause.Error()
 	run.CompletedAt = time.Now().UTC()
-	_, _ = r.record(context.Background(), &events, run, nodeID, trace.EventRunCancelled, map[string]any{
+	_, _ = r.record(ctx, &events, run, nodeID, trace.EventRunCancelled, map[string]any{
 		"error": cause.Error(),
-	})
+	}, r.contextForStateValue(state))
 	return r.result(run, state, events), cause
 }
 
-func (r *Runner[S]) interrupt(run Run, state S, events []trace.Event, nodeID string, interrupt InterruptRecord) (*Result[S], error) {
+func (r *Runner[S]) interrupt(ctx context.Context, run Run, state S, events []trace.Event, nodeID string, interrupt InterruptRecord) (*Result[S], error) {
 	run.Status = StatusInterrupted
 	run.CompletedAt = time.Now().UTC()
-	_, _ = r.record(context.Background(), &events, run, nodeID, trace.EventRunInterrupted, interrupt.Request)
+	_, _ = r.record(ctx, &events, run, nodeID, trace.EventRunInterrupted, interrupt.Request, r.contextForStateValue(state))
 	return r.result(run, state, events), nil
 }
 
@@ -318,6 +342,178 @@ func (r *Runner[S]) result(run Run, state S, events []trace.Event) *Result[S] {
 		Events:      append([]trace.Event(nil), events...),
 		Checkpoints: checkpoints,
 	}
+}
+
+func (r *Runner[S]) stateSnapshot(state S) (json.RawMessage, error) {
+	if !r.eventContext.Enabled {
+		return nil, nil
+	}
+	return r.serializer.Marshal(state)
+}
+
+func (r *Runner[S]) contextForStateValue(state S) *trace.EventContext {
+	raw, err := r.stateSnapshot(state)
+	if err != nil {
+		return nil
+	}
+	return r.contextWithState(raw)
+}
+
+func (r *Runner[S]) contextWithState(state json.RawMessage) *trace.EventContext {
+	if !r.eventContext.Enabled || len(state) == 0 {
+		return nil
+	}
+	return &trace.EventContext{
+		Current: trace.ContextSnapshot{
+			State: cloneRawMessage(state),
+		},
+	}
+}
+
+func (r *Runner[S]) contextWithStateChange(before json.RawMessage, after json.RawMessage) *trace.EventContext {
+	if !r.eventContext.Enabled {
+		return nil
+	}
+	return &trace.EventContext{
+		Current: trace.ContextSnapshot{
+			State: cloneRawMessage(after),
+		},
+		Change: &trace.ContextChange{
+			Before: cloneRawMessage(before),
+			After:  cloneRawMessage(after),
+		},
+	}
+}
+
+func (r *Runner[S]) contextForNodeEvent(ctx context.Context, eventType string, payload any, state json.RawMessage) *trace.EventContext {
+	if !r.eventContext.Enabled {
+		return nil
+	}
+	eventContext := r.contextWithState(state)
+	switch eventType {
+	case trace.EventPromptRendered:
+		eventContext = ensureEventContext(eventContext)
+		eventContext.Current.LLMRequest = trace.Payload(payload)
+	case trace.EventPromptAdjusted:
+		eventContext = mergeEventContext(eventContext, compactContext(payload))
+	case trace.EventToolStarted:
+		eventContext = ensureEventContext(eventContext)
+		eventContext.Current.ToolCall = trace.Payload(payload)
+	case trace.EventToolCompleted:
+		eventContext = ensureEventContext(eventContext)
+		eventContext.Current.ToolResult = trace.Payload(payload)
+	}
+	if override, ok := trace.EventContextFromContext(ctx); ok {
+		eventContext = mergeEventContext(eventContext, override)
+	}
+	return eventContext
+}
+
+func compactContext(payload any) *trace.EventContext {
+	raw := trace.Payload(payload)
+	if len(raw) == 0 {
+		return nil
+	}
+	var compact struct {
+		Prompt json.RawMessage `json:"prompt"`
+		Ops    json.RawMessage `json:"ops"`
+	}
+	if err := json.Unmarshal(raw, &compact); err != nil {
+		return nil
+	}
+	eventContext := &trace.EventContext{}
+	if len(compact.Prompt) > 0 {
+		eventContext.Current.Prompt = cloneRawMessage(compact.Prompt)
+		if eventContext.Change == nil {
+			eventContext.Change = &trace.ContextChange{}
+		}
+		eventContext.Change.After = cloneRawMessage(compact.Prompt)
+	}
+	if len(compact.Ops) > 0 {
+		if eventContext.Change == nil {
+			eventContext.Change = &trace.ContextChange{}
+		}
+		eventContext.Change.Ops = cloneRawMessage(compact.Ops)
+	}
+	return eventContext
+}
+
+func ensureEventContext(eventContext *trace.EventContext) *trace.EventContext {
+	if eventContext != nil {
+		return eventContext
+	}
+	return &trace.EventContext{}
+}
+
+func mergeEventContext(base *trace.EventContext, override *trace.EventContext) *trace.EventContext {
+	if override == nil {
+		return cloneEventContext(base)
+	}
+	result := cloneEventContext(base)
+	if result == nil {
+		result = &trace.EventContext{}
+	}
+	mergeSnapshot(&result.Current, override.Current)
+	if override.Change != nil {
+		result.Change = cloneContextChange(override.Change)
+	}
+	return result
+}
+
+func mergeSnapshot(target *trace.ContextSnapshot, source trace.ContextSnapshot) {
+	if len(source.State) > 0 {
+		target.State = cloneRawMessage(source.State)
+	}
+	if len(source.Messages) > 0 {
+		target.Messages = cloneRawMessage(source.Messages)
+	}
+	if len(source.Prompt) > 0 {
+		target.Prompt = cloneRawMessage(source.Prompt)
+	}
+	if len(source.LLMRequest) > 0 {
+		target.LLMRequest = cloneRawMessage(source.LLMRequest)
+	}
+	if len(source.ToolCall) > 0 {
+		target.ToolCall = cloneRawMessage(source.ToolCall)
+	}
+	if len(source.ToolResult) > 0 {
+		target.ToolResult = cloneRawMessage(source.ToolResult)
+	}
+}
+
+func cloneEventContext(eventContext *trace.EventContext) *trace.EventContext {
+	if eventContext == nil {
+		return nil
+	}
+	cloned := &trace.EventContext{
+		Current: trace.ContextSnapshot{
+			State:      cloneRawMessage(eventContext.Current.State),
+			Messages:   cloneRawMessage(eventContext.Current.Messages),
+			Prompt:     cloneRawMessage(eventContext.Current.Prompt),
+			LLMRequest: cloneRawMessage(eventContext.Current.LLMRequest),
+			ToolCall:   cloneRawMessage(eventContext.Current.ToolCall),
+			ToolResult: cloneRawMessage(eventContext.Current.ToolResult),
+		},
+	}
+	if eventContext.Change != nil {
+		cloned.Change = cloneContextChange(eventContext.Change)
+	}
+	return cloned
+}
+
+func cloneContextChange(change *trace.ContextChange) *trace.ContextChange {
+	if change == nil {
+		return nil
+	}
+	return &trace.ContextChange{
+		Before: cloneRawMessage(change.Before),
+		After:  cloneRawMessage(change.After),
+		Ops:    cloneRawMessage(change.Ops),
+	}
+}
+
+func cloneRawMessage(raw json.RawMessage) json.RawMessage {
+	return json.RawMessage(bytes.Clone(raw))
 }
 
 func cloneMetadata(metadata map[string]string) map[string]string {

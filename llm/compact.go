@@ -75,7 +75,18 @@ func CompactMessages(ctx context.Context, messages []Message, plan lqprompt.Comp
 	result.BeforeEstimate = before
 	result.AfterEstimate = after
 	if result.Changed {
-		if _, err := trace.Emit(ctx, trace.EventPromptAdjusted, result); err != nil {
+		emitCtx := trace.WithEventContext(ctx, &trace.EventContext{
+			Current: trace.ContextSnapshot{
+				Messages: trace.Payload(compacted),
+				Prompt:   trace.Payload(result.Prompt),
+			},
+			Change: &trace.ContextChange{
+				Before: trace.Payload(messages),
+				After:  trace.Payload(compacted),
+				Ops:    trace.Payload(result.Ops),
+			},
+		})
+		if _, err := trace.Emit(emitCtx, trace.EventPromptAdjusted, result); err != nil {
 			return nil, lqprompt.CompactResult{}, err
 		}
 	}

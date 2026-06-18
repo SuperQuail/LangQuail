@@ -216,11 +216,7 @@ func executeCall[S any](ctx context.Context, nodeID string, metadata map[string]
 			}, nil
 		}
 	}
-	if _, err := trace.Emit(ctx, trace.EventToolStarted, map[string]any{
-		"tool":         call.Name,
-		"tool_call_id": call.ID,
-		"arguments":    call.Arguments,
-	}); err != nil {
+	if _, err := trace.Emit(ctx, trace.EventToolStarted, call); err != nil {
 		return Result{}, graph.Noop[S](), err
 	}
 	result, err := item.ExecuteJSON(ctx, call.Arguments)
@@ -233,20 +229,24 @@ func executeCall[S any](ctx context.Context, nodeID string, metadata map[string]
 	}
 	result.CallID = call.ID
 	result.Name = call.Name
-	result, err = applyAfterToolAdjuster(ctx, nodeID, metadata, call, result)
+	result, completedContext, err := applyAfterToolAdjuster(ctx, nodeID, metadata, call, result)
 	if err != nil {
 		return Result{}, graph.Noop[S](), err
 	}
-	if _, err := trace.Emit(ctx, trace.EventToolCompleted, result); err != nil {
+	emitCtx := ctx
+	if completedContext != nil {
+		emitCtx = trace.WithEventContext(ctx, completedContext)
+	}
+	if _, err := trace.Emit(emitCtx, trace.EventToolCompleted, result); err != nil {
 		return Result{}, graph.Noop[S](), err
 	}
 	return result, graph.Noop[S](), nil
 }
 
-func applyAfterToolAdjuster(ctx context.Context, nodeID string, metadata map[string]string, call Call, result Result) (Result, error) {
+func applyAfterToolAdjuster(ctx context.Context, nodeID string, metadata map[string]string, call Call, result Result) (Result, *trace.EventContext, error) {
 	adjuster, ok := AdjusterFromContext(ctx)
 	if !ok {
-		return result, nil
+		return result, nil, nil
 	}
 	adjusted, err := adjuster.AfterTool(ctx, AfterToolRequest{
 		NodeID:   nodeID,
@@ -255,11 +255,12 @@ func applyAfterToolAdjuster(ctx context.Context, nodeID string, metadata map[str
 		Metadata: cloneStringMap(metadata),
 	})
 	if err != nil {
-		return Result{}, err
+		return Result{}, nil, err
 	}
 	if adjusted.Result == nil {
-		return result, nil
+		return result, nil, nil
 	}
+	before := cloneResult(result)
 	next := cloneResult(*adjusted.Result)
 	if next.CallID == "" {
 		next.CallID = call.ID
@@ -267,7 +268,15 @@ func applyAfterToolAdjuster(ctx context.Context, nodeID string, metadata map[str
 	if next.Name == "" {
 		next.Name = call.Name
 	}
-	return next, nil
+	return next, &trace.EventContext{
+		Current: trace.ContextSnapshot{
+			ToolResult: trace.Payload(next),
+		},
+		Change: &trace.ContextChange{
+			Before: trace.Payload(before),
+			After:  trace.Payload(next),
+		},
+	}, nil
 }
 
 func ErrorResult(call Call, err error) Result {

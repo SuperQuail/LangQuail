@@ -11,6 +11,10 @@ type Option[S any] func(*Runner[S])
 
 type EventHandler func(context.Context, trace.Event) error
 
+type EventContextOptions struct {
+	Enabled bool
+}
+
 func WithRecorder[S any](recorder trace.Recorder) Option[S] {
 	return func(r *Runner[S]) {
 		if recorder != nil {
@@ -38,6 +42,12 @@ func WithSerializer[S any](serializer checkpoint.Serializer[S]) Option[S] {
 func WithEventHandler[S any](handler EventHandler) Option[S] {
 	return func(r *Runner[S]) {
 		r.onEvent = handler
+	}
+}
+
+func WithEventContext[S any](options EventContextOptions) Option[S] {
+	return func(r *Runner[S]) {
+		r.eventContext = options
 	}
 }
 
