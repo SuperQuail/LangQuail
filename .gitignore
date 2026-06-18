@@ -17,3 +17,6 @@ duplicate.cover
 *.exe
 *.test
 vendor/
+
+# Local docs
+docs/

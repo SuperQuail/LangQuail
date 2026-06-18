@@ -15,6 +15,7 @@ import (
 	"github.com/superquail/langquail/graph"
 	"github.com/superquail/langquail/prompt"
 	lqruntime "github.com/superquail/langquail/runtime"
+	"github.com/superquail/langquail/tool/skill"
 	"github.com/superquail/langquail/trace"
 )
 
@@ -25,6 +26,10 @@ type Application interface {
 	Workflows() []graph.Workflow
 	Snapshot(string) (graph.Snapshot, bool)
 	Context(context.Context) context.Context
+}
+
+type skillApplication interface {
+	SkillRegistry() *skill.Registry
 }
 
 type ServeOption func(*serveConfig)
@@ -196,6 +201,10 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handlePromptRender(w, r, parts[1])
 	case r.Method == http.MethodPost && len(parts) == 3 && parts[0] == "prompts" && parts[2] == "drafts":
 		s.handlePromptDraft(w, r, parts[1])
+	case r.Method == http.MethodGet && len(parts) == 1 && parts[0] == "skills":
+		s.handleSkills(w, r)
+	case r.Method == http.MethodGet && len(parts) == 2 && parts[0] == "skills":
+		s.handleSkillGet(w, r, parts[1])
 	case r.Method == http.MethodPost && len(parts) == 3 && parts[0] == "runs" && parts[2] == "invoke":
 		s.handleInvoke(w, r, parts[1])
 	case r.Method == http.MethodPost && len(parts) == 3 && parts[0] == "runs" && parts[2] == "resume":
@@ -304,6 +313,34 @@ func (s *Server) handlePromptDraft(w http.ResponseWriter, r *http.Request, id st
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleSkills(w http.ResponseWriter, _ *http.Request) {
+	registry := s.skillRegistry()
+	if registry == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"skills": []skillSummary{}})
+		return
+	}
+	skills := registry.List()
+	summaries := make([]skillSummary, 0, len(skills))
+	for _, item := range skills {
+		summaries = append(summaries, summarizeSkill(item))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"skills": summaries})
+}
+
+func (s *Server) handleSkillGet(w http.ResponseWriter, _ *http.Request, id string) {
+	registry := s.skillRegistry()
+	if registry == nil {
+		writeError(w, http.StatusNotFound, "skill registry not configured")
+		return
+	}
+	item, exists := registry.Get(id)
+	if !exists {
+		writeError(w, http.StatusNotFound, "skill not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
 }
 
 func (s *Server) handleInvoke(w http.ResponseWriter, r *http.Request, workflowID string) {
@@ -422,6 +459,38 @@ type invokeEnvelope struct {
 	SessionID string            `json:"session_id,omitempty"`
 	Metadata  map[string]string `json:"metadata,omitempty"`
 	StartAt   string            `json:"start_at,omitempty"`
+}
+
+type skillSummary struct {
+	ID          string            `json:"id"`
+	Description string            `json:"description"`
+	Metadata    map[string]any    `json:"metadata,omitempty"`
+	UI          *skill.UIMetadata `json:"ui,omitempty"`
+	Resources   map[string]int    `json:"resources,omitempty"`
+}
+
+func (s *Server) skillRegistry() *skill.Registry {
+	app, ok := s.app.(skillApplication)
+	if !ok {
+		return nil
+	}
+	return app.SkillRegistry()
+}
+
+func summarizeSkill(item skill.Skill) skillSummary {
+	summary := skillSummary{
+		ID:          item.ID,
+		Description: item.Description,
+		Metadata:    item.Metadata,
+		UI:          item.UI,
+	}
+	if len(item.Resources) > 0 {
+		summary.Resources = make(map[string]int)
+		for _, resource := range item.Resources {
+			summary.Resources[string(resource.Kind)]++
+		}
+	}
+	return summary
 }
 
 func writeRawJSON(w http.ResponseWriter, status int, raw []byte) {

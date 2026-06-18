@@ -12,22 +12,26 @@ import (
 	"github.com/superquail/langquail/llm"
 	"github.com/superquail/langquail/prompt"
 	"github.com/superquail/langquail/tool"
+	"github.com/superquail/langquail/tool/skill"
 )
 
 type AppBuilder struct {
-	projectID string
-	providers []llm.Provider
-	promptDir string
-	tools     []tool.Executable
-	workflows []graph.Workflow
-	store     any
-	adjuster  any
+	projectID     string
+	providers     []llm.Provider
+	promptDir     string
+	skillDirs     []string
+	skillRegistry *skill.Registry
+	tools         []tool.Executable
+	workflows     []graph.Workflow
+	store         any
+	adjuster      any
 }
 
 type App struct {
 	projectID    string
 	providers    llm.ProviderSet
 	prompts      *prompt.Registry
+	skills       *skill.Registry
 	tools        *tool.Registry
 	workflows    map[string]graph.Workflow
 	store        any
@@ -52,6 +56,22 @@ func (b *AppBuilder) Prompts(path string) *AppBuilder {
 		return b
 	}
 	b.promptDir = path
+	return b
+}
+
+func (b *AppBuilder) SkillDirs(paths ...string) *AppBuilder {
+	if b == nil {
+		return b
+	}
+	b.skillDirs = append(b.skillDirs, paths...)
+	return b
+}
+
+func (b *AppBuilder) SkillRegistry(registry *skill.Registry) *AppBuilder {
+	if b == nil {
+		return b
+	}
+	b.skillRegistry = registry
 	return b
 }
 
@@ -112,6 +132,11 @@ func (b *AppBuilder) Build() (*App, error) {
 		}
 	}
 
+	skills, err := buildSkillRegistry(b.skillRegistry, b.skillDirs)
+	if err != nil {
+		return nil, err
+	}
+
 	tools := tool.NewRegistry()
 	for _, executable := range b.tools {
 		if err := tools.Register(executable); err != nil {
@@ -151,6 +176,7 @@ func (b *AppBuilder) Build() (*App, error) {
 		projectID:    b.projectID,
 		providers:    providers,
 		prompts:      prompts,
+		skills:       skills,
 		tools:        tools,
 		workflows:    workflows,
 		store:        b.store,
@@ -178,6 +204,13 @@ func (a *App) PromptRegistry() *prompt.Registry {
 		return nil
 	}
 	return a.prompts
+}
+
+func (a *App) SkillRegistry() *skill.Registry {
+	if a == nil {
+		return nil
+	}
+	return a.skills
 }
 
 func (a *App) ToolRegistry() *tool.Registry {
@@ -280,4 +313,30 @@ func (a *App) Serve(addr string, opts ...api.ServeOption) error {
 		return err
 	}
 	return server.Serve(addr)
+}
+
+func buildSkillRegistry(existing *skill.Registry, dirs []string) (*skill.Registry, error) {
+	if existing == nil && len(dirs) == 0 {
+		return nil, nil
+	}
+	registry := skill.NewRegistry()
+	if existing != nil {
+		for _, item := range existing.List() {
+			if err := registry.Register(item); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if len(dirs) > 0 {
+		loaded, err := skill.LoadRoots(dirs...)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range loaded.List() {
+			if err := registry.Register(item); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return registry, nil
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/superquail/langquail/llm"
 	lqruntime "github.com/superquail/langquail/runtime"
 	"github.com/superquail/langquail/tool"
+	"github.com/superquail/langquail/tool/skill"
 )
 
 type appState struct {
@@ -31,8 +32,42 @@ type lookupOutput struct {
 }
 
 func TestVersion(t *testing.T) {
-	if lq.Version != "1.0.0-alpha.1" {
-		t.Fatalf("Version = %q, want %q", lq.Version, "1.0.0-alpha.1")
+	if lq.Version != "1.0.0-alpha.2" {
+		t.Fatalf("Version = %q, want %q", lq.Version, "1.0.0-alpha.2")
+	}
+}
+
+func TestAppBuilderRegistersSkills(t *testing.T) {
+	skillRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(skillRoot, "planner"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(skill) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skillRoot, "planner", "SKILL.md"), []byte("---\nname: planner\ndescription: Plan work\n---\nUse planning steps."), 0o644); err != nil {
+		t.Fatalf("WriteFile(skill) error = %v", err)
+	}
+	manual := skill.NewRegistry()
+	if err := manual.Register(skill.Skill{ID: "manual", Description: "Manual skill"}); err != nil {
+		t.Fatalf("Register(manual) error = %v", err)
+	}
+
+	app, err := lq.New("project").
+		SkillDirs(skillRoot).
+		SkillRegistry(manual).
+		Build()
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	registry := app.SkillRegistry()
+	if registry == nil {
+		t.Fatal("SkillRegistry() is nil")
+	}
+	ids := registry.IDs()
+	if len(ids) != 2 || ids[0] != "manual" || ids[1] != "planner" {
+		t.Fatalf("skill IDs = %#v", ids)
+	}
+	planner, exists := registry.Get("planner")
+	if !exists || planner.Description != "Plan work" || !strings.Contains(planner.Instructions, "planning steps") {
+		t.Fatalf("planner skill = %#v exists=%v", planner, exists)
 	}
 }
 

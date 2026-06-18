@@ -19,6 +19,7 @@ import (
 	"github.com/superquail/langquail/graph"
 	"github.com/superquail/langquail/hitl"
 	lqruntime "github.com/superquail/langquail/runtime"
+	"github.com/superquail/langquail/tool/skill"
 	"github.com/superquail/langquail/trace"
 )
 
@@ -164,6 +165,102 @@ func TestServerHTTPAuthAndPromptRoutes(t *testing.T) {
 	}
 	if len(rendered.Segments) != 1 || rendered.Segments[0].Content != "Hello LangQuail" {
 		t.Fatalf("rendered = %#v", rendered)
+	}
+}
+
+func TestServerSkillRoutes(t *testing.T) {
+	emptyApp := buildServerTestApp(t, false, "")
+	emptyServer, err := emptyApp.Server(api.WithOutput(io.Discard))
+	if err != nil {
+		t.Fatalf("empty Server() error = %v", err)
+	}
+	emptyHTTP := httptest.NewServer(emptyServer.Handler())
+	defer emptyHTTP.Close()
+	req, err := http.NewRequest(http.MethodGet, emptyHTTP.URL+"/skills", nil)
+	if err != nil {
+		t.Fatalf("NewRequest(empty skills) error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+emptyServer.Token())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do(empty skills) error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("empty skills status = %d body=%s", resp.StatusCode, body)
+	}
+	var emptyList struct {
+		Skills []skillSummaryResponse `json:"skills"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&emptyList); err != nil {
+		t.Fatalf("decode empty skills: %v", err)
+	}
+	if len(emptyList.Skills) != 0 {
+		t.Fatalf("empty skills = %#v", emptyList.Skills)
+	}
+
+	skillRoot := t.TempDir()
+	writeServerSkill(t, skillRoot, "coder", "Write code")
+	app, err := lq.New("server-project").SkillDirs(skillRoot).Build()
+	if err != nil {
+		t.Fatalf("Build(skill app) error = %v", err)
+	}
+	server, err := app.Server(api.WithOutput(io.Discard))
+	if err != nil {
+		t.Fatalf("Server() error = %v", err)
+	}
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	req, err = http.NewRequest(http.MethodGet, httpServer.URL+"/skills", nil)
+	if err != nil {
+		t.Fatalf("NewRequest(skills) error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+server.Token())
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do(skills) error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("skills status = %d body=%s", resp.StatusCode, body)
+	}
+	var listed struct {
+		Skills []skillSummaryResponse `json:"skills"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&listed); err != nil {
+		t.Fatalf("decode skills: %v", err)
+	}
+	if len(listed.Skills) != 1 || listed.Skills[0].ID != "coder" || listed.Skills[0].Resources["reference"] != 1 || listed.Skills[0].Resources["script"] != 1 {
+		t.Fatalf("listed skills = %#v", listed.Skills)
+	}
+
+	req, err = http.NewRequest(http.MethodGet, httpServer.URL+"/skills/coder", nil)
+	if err != nil {
+		t.Fatalf("NewRequest(skill detail) error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+server.Token())
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do(skill detail) error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("skill detail status = %d body=%s", resp.StatusCode, body)
+	}
+	var detail skill.Skill
+	if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
+		t.Fatalf("decode skill detail: %v", err)
+	}
+	if detail.ID != "coder" || !strings.Contains(detail.Instructions, "Use code skill") || len(detail.Resources) != 2 {
+		t.Fatalf("skill detail = %#v", detail)
+	}
+
+	if status := statusCode(t, http.MethodGet, httpServer.URL+"/skills/missing", "Bearer "+server.Token(), nil); status != http.StatusNotFound {
+		t.Fatalf("missing skill status = %d", status)
 	}
 }
 
@@ -544,4 +641,30 @@ type statusError struct {
 
 func (e *statusError) Error() string {
 	return strings.TrimSpace(e.body)
+}
+
+type skillSummaryResponse struct {
+	ID          string         `json:"id"`
+	Description string         `json:"description"`
+	Resources   map[string]int `json:"resources"`
+}
+
+func writeServerSkill(t *testing.T, root string, name string, description string) {
+	t.Helper()
+	skillDir := filepath.Join(root, name)
+	if err := os.MkdirAll(filepath.Join(skillDir, "references"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(references) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(skillDir, "scripts"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(scripts) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: "+name+"\ndescription: "+description+"\n---\nUse code skill."), 0o644); err != nil {
+		t.Fatalf("WriteFile(SKILL.md) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "references", "guide.md"), []byte("# Guide\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(reference) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "scripts", "run.sh"), []byte("echo ok\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(script) error = %v", err)
+	}
 }
