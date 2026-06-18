@@ -11,6 +11,7 @@ type Source string
 const (
 	SourceTiktoken  Source = "tiktoken"
 	SourceClaudeAPI Source = "claude_api"
+	SourceGeminiAPI Source = "gemini_api"
 )
 
 type Message struct {

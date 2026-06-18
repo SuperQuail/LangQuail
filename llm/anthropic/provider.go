@@ -59,10 +59,10 @@ func (p *ProviderAdapter) Chat(ctx context.Context, request llm.Request) (llm.Re
 	if p == nil {
 		return llm.Response{}, fmt.Errorf("llm/anthropic: nil provider")
 	}
-	var opts []option.RequestOption
-	if p.apiKey != "" {
-		opts = append(opts, option.WithAPIKey(p.apiKey))
+	if p.apiKey == "" {
+		return llm.Response{}, fmt.Errorf("llm/anthropic: api key is required")
 	}
+	opts := []option.RequestOption{option.WithoutEnvironmentDefaults(), option.WithAPIKey(p.apiKey)}
 	if p.baseURL != "" {
 		opts = append(opts, option.WithBaseURL(p.baseURL))
 	}
@@ -122,10 +122,10 @@ func (p *ProviderAdapter) ChatStream(ctx context.Context, request llm.Request, h
 	if p == nil {
 		return llm.Response{}, fmt.Errorf("llm/anthropic: nil provider")
 	}
-	var opts []option.RequestOption
-	if p.apiKey != "" {
-		opts = append(opts, option.WithAPIKey(p.apiKey))
+	if p.apiKey == "" {
+		return llm.Response{}, fmt.Errorf("llm/anthropic: api key is required")
 	}
+	opts := []option.RequestOption{option.WithoutEnvironmentDefaults(), option.WithAPIKey(p.apiKey)}
 	if p.baseURL != "" {
 		opts = append(opts, option.WithBaseURL(p.baseURL))
 	}

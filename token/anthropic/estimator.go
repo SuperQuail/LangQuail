@@ -52,10 +52,10 @@ func (e *Estimator) CountPromptTokens(ctx context.Context, request token.Estimat
 	if err := token.ValidateRequest(request); err != nil {
 		return token.Estimate{}, err
 	}
-	var opts []option.RequestOption
-	if e.apiKey != "" {
-		opts = append(opts, option.WithAPIKey(e.apiKey))
+	if e.apiKey == "" {
+		return token.Estimate{}, fmt.Errorf("token/anthropic: api key is required")
 	}
+	opts := []option.RequestOption{option.WithoutEnvironmentDefaults(), option.WithAPIKey(e.apiKey)}
 	if e.baseURL != "" {
 		opts = append(opts, option.WithBaseURL(e.baseURL))
 	}
