@@ -19,6 +19,7 @@ import (
 	"github.com/superquail/langquail/graph"
 	"github.com/superquail/langquail/hitl"
 	lqruntime "github.com/superquail/langquail/runtime"
+	"github.com/superquail/langquail/tool"
 	"github.com/superquail/langquail/tool/skill"
 	"github.com/superquail/langquail/trace"
 )
@@ -30,6 +31,15 @@ type serverState struct {
 type resumeServerState struct {
 	Value string   `json:"value"`
 	Path  []string `json:"path,omitempty"`
+}
+
+type serverToolState struct {
+	Calls   []tool.Call   `json:"calls"`
+	Results []tool.Result `json:"results,omitempty"`
+}
+
+type serverToolInput struct {
+	Query string `json:"query"`
 }
 
 func TestServerTokenLifecycle(t *testing.T) {
@@ -448,6 +458,64 @@ func TestServerWebSocketReceivesLiveEventContext(t *testing.T) {
 	}
 }
 
+func TestServerWebSocketReceivesToolProgressEvent(t *testing.T) {
+	app := buildToolProgressServerTestApp(t)
+	server, err := app.Server(api.WithConfigDir(t.TempDir()), api.WithOutput(io.Discard))
+	if err != nil {
+		t.Fatalf("Server() error = %v", err)
+	}
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/events?token=" + server.Token()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("Dial error = %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	done := make(chan error, 1)
+	go func() {
+		body := `{"calls":[{"id":"call_ws","name":"lookup","arguments":{"query":"ws"}}]}`
+		req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/runs/server.tool.progress/invoke", strings.NewReader(body))
+		if err != nil {
+			done <- err
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+server.Token())
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			done <- err
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			done <- &statusError{status: resp.StatusCode, body: string(body)}
+			return
+		}
+		done <- nil
+	}()
+
+	progress := readWebSocketEvent(t, ctx, conn, trace.EventToolProgress)
+	var payload struct {
+		CallID    string `json:"call_id"`
+		Name      string `json:"name"`
+		ElapsedMS int64  `json:"elapsed_ms"`
+	}
+	if err := json.Unmarshal(progress.Payload, &payload); err != nil {
+		t.Fatalf("decode progress payload: %v", err)
+	}
+	if payload.CallID != "call_ws" || payload.Name != "lookup" || payload.ElapsedMS < 0 {
+		t.Fatalf("progress payload = %#v", payload)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("invoke error = %v", err)
+	}
+}
+
 func TestServerResumeUsesCallerProvidedState(t *testing.T) {
 	app := buildResumeServerTestApp(t)
 	firstServer, err := app.Server(api.WithOutput(io.Discard))
@@ -599,6 +667,39 @@ func buildResumeServerTestApp(t *testing.T) *lq.App {
 	return app
 }
 
+func buildToolProgressServerTestApp(t *testing.T) *lq.App {
+	t.Helper()
+	registry := tool.NewRegistry()
+	if err := registry.Register(tool.Define[serverToolInput, string]("lookup").
+		Execute(func(ctx context.Context, input serverToolInput) (string, error) {
+			time.Sleep(30 * time.Millisecond)
+			return "found:" + input.Query, nil
+		})); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	g := graph.NewStateGraph[serverToolState]("server.tool.progress")
+	g.Node(tool.Node("run_tool", tool.NodeSpec[serverToolState]{
+		Registry:         registry,
+		ProgressInterval: 5 * time.Millisecond,
+		Calls: func(ctx context.Context, state serverToolState) ([]tool.Call, error) {
+			return state.Calls, nil
+		},
+		Output: func(ctx context.Context, state serverToolState, results []tool.Result) (graph.Command[serverToolState], error) {
+			state.Results = append(state.Results, results...)
+			return graph.Update(state), nil
+		},
+	}))
+	g.Start("run_tool")
+	g.Finish("run_tool")
+
+	app, err := lq.New("server-project").Workflows(lq.Executable(g)).Build()
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	return app
+}
+
 func requireAPIEvent(t *testing.T, events []trace.Event, eventType string) trace.Event {
 	t.Helper()
 	for _, event := range events {
@@ -608,6 +709,26 @@ func requireAPIEvent(t *testing.T, events []trace.Event, eventType string) trace
 	}
 	t.Fatalf("event %s not found in %#v", eventType, events)
 	return trace.Event{}
+}
+
+func readWebSocketEvent(t *testing.T, ctx context.Context, conn *websocket.Conn, eventType string) trace.Event {
+	t.Helper()
+	for {
+		_, message, err := conn.Read(ctx)
+		if err != nil {
+			t.Fatalf("Read websocket error = %v", err)
+		}
+		var envelope struct {
+			Type  string      `json:"type"`
+			Event trace.Event `json:"event"`
+		}
+		if err := json.Unmarshal(message, &envelope); err != nil {
+			t.Fatalf("decode websocket message: %v", err)
+		}
+		if envelope.Type == "event" && envelope.Event.Type == eventType {
+			return envelope.Event
+		}
+	}
 }
 
 func statusCode(t *testing.T, method string, url string, authorization string, body io.Reader) int {

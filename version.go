@@ -1,3 +1,3 @@
 package langquail
 
-const Version = "1.0.0-alpha.2"
+const Version = "1.0.0-alpha.4"

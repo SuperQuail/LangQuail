@@ -26,6 +26,7 @@ const (
 	EventLLMCompleted     = "llm.completed"
 	EventLLMFailed        = "llm.failed"
 	EventToolStarted      = "tool.started"
+	EventToolProgress     = "tool.progress"
 	EventToolCompleted    = "tool.completed"
 	EventToolFailed       = "tool.failed"
 	EventMessageRead      = "message.read"

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"sync"
 	"time"
 
 	"github.com/superquail/langquail/checkpoint"
@@ -143,7 +144,10 @@ func (r *Runner[S]) run(ctx context.Context, run Run, initialState S, startAt st
 			return r.result(run, state, events), err
 		}
 
+		var emitMu sync.Mutex
 		nodeCtx := trace.WithEmitter(ctx, func(emitCtx context.Context, eventType string, payload any) (trace.Event, error) {
+			emitMu.Lock()
+			defer emitMu.Unlock()
 			return r.record(emitCtx, &events, run, current, eventType, payload, r.contextForNodeEvent(emitCtx, eventType, payload, nodeInputRaw))
 		})
 		if resumeResponse != nil {

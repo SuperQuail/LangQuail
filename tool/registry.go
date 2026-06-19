@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/superquail/langquail/graph"
 	"github.com/superquail/langquail/hitl"
+	"github.com/superquail/langquail/internal/ids"
 	"github.com/superquail/langquail/llm"
 	"github.com/superquail/langquail/trace"
 )
@@ -95,13 +97,14 @@ func (r *Registry) LLMSpecs(names ...string) ([]llm.ToolSpec, error) {
 }
 
 type NodeSpec[S any] struct {
-	Registry        *Registry
-	ToolIDs         []string
-	Calls           func(context.Context, S) ([]Call, error)
-	Output          func(context.Context, S, []Result) (graph.Command[S], error)
-	Error           func(context.Context, S, Call, error) (graph.Command[S], error)
-	ContinueOnError bool
-	Metadata        map[string]string
+	Registry         *Registry
+	ToolIDs          []string
+	Calls            func(context.Context, S) ([]Call, error)
+	Output           func(context.Context, S, []Result) (graph.Command[S], error)
+	Error            func(context.Context, S, Call, error) (graph.Command[S], error)
+	ContinueOnError  bool
+	ProgressInterval time.Duration
+	Metadata         map[string]string
 }
 
 func Node[S any](id string, spec NodeSpec[S]) graph.NodeSpec[S] {
@@ -133,10 +136,11 @@ func Node[S any](id string, spec NodeSpec[S]) graph.NodeSpec[S] {
 			}
 			results := make([]Result, 0, len(calls))
 			for _, call := range calls {
+				call = normalizeCall(call)
 				if err := requireAllowedTool(call.Name, spec.ToolIDs); err != nil {
 					return graph.Noop[S](), err
 				}
-				result, command, err := executeCall[S](ctx, id, spec.Metadata, registry, call)
+				result, command, err := executeCall[S](ctx, id, spec.Metadata, spec.ProgressInterval, registry, call)
 				if err != nil {
 					if spec.Error != nil {
 						return spec.Error(ctx, state, call, err)
@@ -192,7 +196,19 @@ func requireAllowedTool(name string, allowed []string) error {
 	return fmt.Errorf("tool: tool %q is not allowed for this node", name)
 }
 
-func executeCall[S any](ctx context.Context, nodeID string, metadata map[string]string, registry *Registry, call Call) (Result, graph.Command[S], error) {
+func normalizeCall(call Call) Call {
+	if call.ID == "" {
+		call.ID = ids.New("call")
+	}
+	return call
+}
+
+type completedEventPayload struct {
+	Result
+	DurationMS int64 `json:"duration_ms"`
+}
+
+func executeCall[S any](ctx context.Context, nodeID string, metadata map[string]string, progressInterval time.Duration, registry *Registry, call Call) (Result, graph.Command[S], error) {
 	item, exists := registry.Get(call.Name)
 	if !exists {
 		return Result{}, graph.Noop[S](), fmt.Errorf("tool: tool %q is not registered", call.Name)
@@ -216,14 +232,19 @@ func executeCall[S any](ctx context.Context, nodeID string, metadata map[string]
 			}, nil
 		}
 	}
+	startedAt := time.Now()
 	if _, err := trace.Emit(ctx, trace.EventToolStarted, call); err != nil {
 		return Result{}, graph.Noop[S](), err
 	}
+	stopProgress := startProgressTicker(ctx, call, startedAt, progressInterval)
 	result, err := item.ExecuteJSON(ctx, call.Arguments)
+	stopProgress()
 	if err != nil {
 		_, _ = trace.Emit(ctx, trace.EventToolFailed, map[string]any{
-			"tool":  call.Name,
-			"error": err.Error(),
+			"tool":        call.Name,
+			"call_id":     call.ID,
+			"duration_ms": elapsedMilliseconds(startedAt),
+			"error":       err.Error(),
 		})
 		return Result{}, graph.Noop[S](), err
 	}
@@ -234,10 +255,18 @@ func executeCall[S any](ctx context.Context, nodeID string, metadata map[string]
 		return Result{}, graph.Noop[S](), err
 	}
 	emitCtx := ctx
-	if completedContext != nil {
-		emitCtx = trace.WithEventContext(ctx, completedContext)
+	if completedContext == nil {
+		completedContext = &trace.EventContext{
+			Current: trace.ContextSnapshot{
+				ToolResult: trace.Payload(result),
+			},
+		}
 	}
-	if _, err := trace.Emit(emitCtx, trace.EventToolCompleted, result); err != nil {
+	emitCtx = trace.WithEventContext(ctx, completedContext)
+	if _, err := trace.Emit(emitCtx, trace.EventToolCompleted, completedEventPayload{
+		Result:     result,
+		DurationMS: elapsedMilliseconds(startedAt),
+	}); err != nil {
 		return Result{}, graph.Noop[S](), err
 	}
 	return result, graph.Noop[S](), nil
