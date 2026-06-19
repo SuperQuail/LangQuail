@@ -32,8 +32,8 @@ type lookupOutput struct {
 }
 
 func TestVersion(t *testing.T) {
-	if lq.Version != "1.0.0-alpha.5" {
-		t.Fatalf("Version = %q, want %q", lq.Version, "1.0.0-alpha.5")
+	if lq.Version != "1.0.0-alpha.6" {
+		t.Fatalf("Version = %q, want %q", lq.Version, "1.0.0-alpha.6")
 	}
 }
 
