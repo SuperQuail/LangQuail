@@ -510,6 +510,7 @@ func (s *Server) serveEventsWS(w http.ResponseWriter, r *http.Request) {
 
 	sub := s.hub.Subscribe(EventFilter{
 		WorkflowID: r.URL.Query().Get("workflow_id"),
+		SessionID:  r.URL.Query().Get("session_id"),
 		RunID:      r.URL.Query().Get("run_id"),
 		NodeID:     r.URL.Query().Get("node_id"),
 	})

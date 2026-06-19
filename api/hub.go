@@ -8,6 +8,7 @@ import (
 
 type EventFilter struct {
 	WorkflowID string
+	SessionID  string
 	RunID      string
 	NodeID     string
 }
@@ -91,6 +92,9 @@ func (s *EventSubscription) matches(event trace.Event) bool {
 		return false
 	}
 	if s.filter.WorkflowID != "" && event.WorkflowID != s.filter.WorkflowID {
+		return false
+	}
+	if s.filter.SessionID != "" && event.SessionID != s.filter.SessionID {
 		return false
 	}
 	if s.filter.RunID != "" && event.RunID != s.filter.RunID {

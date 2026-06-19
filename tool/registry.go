@@ -103,6 +103,7 @@ type NodeSpec[S any] struct {
 	Output           func(context.Context, S, []Result) (graph.Command[S], error)
 	Error            func(context.Context, S, Call, error) (graph.Command[S], error)
 	ContinueOnError  bool
+	MaxConcurrency   int
 	ProgressInterval time.Duration
 	Metadata         map[string]string
 }
@@ -134,6 +135,19 @@ func Node[S any](id string, spec NodeSpec[S]) graph.NodeSpec[S] {
 			if err != nil {
 				return graph.Noop[S](), err
 			}
+			if spec.MaxConcurrency > 1 {
+				return runCallsParallel(ctx, state, parallelRunSpec[S]{
+					NodeID:           id,
+					Metadata:         spec.Metadata,
+					Registry:         registry,
+					ToolIDs:          spec.ToolIDs,
+					Output:           spec.Output,
+					Error:            spec.Error,
+					ContinueOnError:  spec.ContinueOnError,
+					MaxConcurrency:   spec.MaxConcurrency,
+					ProgressInterval: spec.ProgressInterval,
+				}, calls)
+			}
 			results := make([]Result, 0, len(calls))
 			for _, call := range calls {
 				call = normalizeCall(call)
@@ -162,6 +176,18 @@ func Node[S any](id string, spec NodeSpec[S]) graph.NodeSpec[S] {
 			return spec.Output(ctx, state, results)
 		},
 	}
+}
+
+type parallelRunSpec[S any] struct {
+	NodeID           string
+	Metadata         map[string]string
+	Registry         *Registry
+	ToolIDs          []string
+	Output           func(context.Context, S, []Result) (graph.Command[S], error)
+	Error            func(context.Context, S, Call, error) (graph.Command[S], error)
+	ContinueOnError  bool
+	MaxConcurrency   int
+	ProgressInterval time.Duration
 }
 
 type registryContextKey struct{}
@@ -208,33 +234,55 @@ type completedEventPayload struct {
 	DurationMS int64 `json:"duration_ms"`
 }
 
+type preparedCall struct {
+	Index int
+	Call  Call
+	Item  Executable
+}
+
 func executeCall[S any](ctx context.Context, nodeID string, metadata map[string]string, progressInterval time.Duration, registry *Registry, call Call) (Result, graph.Command[S], error) {
+	item, interrupt, err := prepareCall(ctx, registry, call)
+	if err != nil {
+		return Result{}, graph.Noop[S](), err
+	}
+	if interrupt != nil {
+		return Result{}, graph.Command[S]{Interrupt: interrupt}, nil
+	}
+	result, err := executePreparedCall(ctx, nodeID, metadata, progressInterval, item, call)
+	return result, graph.Noop[S](), err
+}
+
+func prepareCall(ctx context.Context, registry *Registry, call Call) (Executable, *graph.Interrupt, error) {
 	item, exists := registry.Get(call.Name)
 	if !exists {
-		return Result{}, graph.Noop[S](), fmt.Errorf("tool: tool %q is not registered", call.Name)
+		return nil, nil, fmt.Errorf("tool: tool %q is not registered", call.Name)
 	}
-	if request, required, err := item.PermissionJSON(ctx, call.Arguments); err != nil {
-		return Result{}, graph.Noop[S](), err
-	} else if required {
-		if response, ok := hitl.ResponseFromContext(ctx); ok {
-			if response.Decision == hitl.DecisionRejected {
-				return Result{}, graph.Noop[S](), ErrPermissionDenied
-			}
-		} else {
-			request.ToolName = call.Name
-			request.ToolCallID = call.ID
-			return Result{}, graph.Command[S]{
-				Interrupt: &graph.Interrupt{
-					Kind:    string(request.Kind),
-					Reason:  request.Reason,
-					Payload: request,
-				},
-			}, nil
+	request, required, err := item.PermissionJSON(ctx, call.Arguments)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !required {
+		return item, nil, nil
+	}
+	if response, ok := hitl.ResponseFromContext(ctx); ok {
+		if response.Decision == hitl.DecisionRejected {
+			return nil, nil, ErrPermissionDenied
 		}
+		return item, nil, nil
 	}
+	request.ToolName = call.Name
+	request.ToolCallID = call.ID
+	return nil, &graph.Interrupt{
+		Kind:    string(request.Kind),
+		Reason:  request.Reason,
+		Payload: request,
+	}, nil
+}
+
+func executePreparedCall(ctx context.Context, nodeID string, metadata map[string]string, progressInterval time.Duration, item Executable, call Call) (Result, error) {
 	startedAt := time.Now()
 	if _, err := trace.Emit(ctx, trace.EventToolStarted, call); err != nil {
-		return Result{}, graph.Noop[S](), err
+		return Result{}, err
 	}
 	stopProgress := startProgressTicker(ctx, call, startedAt, progressInterval)
 	result, err := item.ExecuteJSON(ctx, call.Arguments)
@@ -246,13 +294,13 @@ func executeCall[S any](ctx context.Context, nodeID string, metadata map[string]
 			"duration_ms": elapsedMilliseconds(startedAt),
 			"error":       err.Error(),
 		})
-		return Result{}, graph.Noop[S](), err
+		return Result{}, err
 	}
 	result.CallID = call.ID
 	result.Name = call.Name
 	result, completedContext, err := applyAfterToolAdjuster(ctx, nodeID, metadata, call, result)
 	if err != nil {
-		return Result{}, graph.Noop[S](), err
+		return Result{}, err
 	}
 	emitCtx := ctx
 	if completedContext == nil {
@@ -267,9 +315,200 @@ func executeCall[S any](ctx context.Context, nodeID string, metadata map[string]
 		Result:     result,
 		DurationMS: elapsedMilliseconds(startedAt),
 	}); err != nil {
-		return Result{}, graph.Noop[S](), err
+		return Result{}, err
 	}
-	return result, graph.Noop[S](), nil
+	return result, nil
+}
+
+func runCallsParallel[S any](ctx context.Context, state S, spec parallelRunSpec[S], calls []Call) (graph.Command[S], error) {
+	prepared, results, filled, interrupt, failedCall, err := prepareParallelCalls(ctx, spec, calls)
+	if interrupt != nil {
+		return graph.Command[S]{Interrupt: interrupt}, nil
+	}
+	if err != nil {
+		return handleToolError(ctx, state, spec.Error, spec.ContinueOnError, failedCall, err, results, spec.Output)
+	}
+
+	results, filled, failedCall, err = executePreparedCallsParallel(ctx, spec, prepared, results, filled)
+	if err != nil {
+		return handleToolError(ctx, state, spec.Error, spec.ContinueOnError, failedCall, err, results, spec.Output)
+	}
+	if spec.Output == nil {
+		return graph.Noop[S](), nil
+	}
+	return spec.Output(ctx, state, compactResults(results, filled))
+}
+
+func handleToolError[S any](
+	ctx context.Context,
+	state S,
+	errorHandler func(context.Context, S, Call, error) (graph.Command[S], error),
+	continueOnError bool,
+	call Call,
+	err error,
+	results []Result,
+	output func(context.Context, S, []Result) (graph.Command[S], error),
+) (graph.Command[S], error) {
+	if err == nil {
+		if output == nil {
+			return graph.Noop[S](), nil
+		}
+		return output(ctx, state, results)
+	}
+	if errorHandler != nil {
+		return errorHandler(ctx, state, call, err)
+	}
+	if continueOnError {
+		if output == nil {
+			return graph.Noop[S](), nil
+		}
+		return output(ctx, state, results)
+	}
+	return graph.Noop[S](), err
+}
+
+func prepareParallelCalls[S any](ctx context.Context, spec parallelRunSpec[S], calls []Call) ([]preparedCall, []Result, []bool, *graph.Interrupt, Call, error) {
+	prepared := make([]preparedCall, 0, len(calls))
+	results := make([]Result, len(calls))
+	filled := make([]bool, len(calls))
+	for index, call := range calls {
+		call = normalizeCall(call)
+		if err := requireAllowedTool(call.Name, spec.ToolIDs); err != nil {
+			if spec.ContinueOnError {
+				results[index] = ErrorResult(call, err)
+				filled[index] = true
+				continue
+			}
+			return nil, nil, nil, nil, call, err
+		}
+		item, interrupt, err := prepareCall(ctx, spec.Registry, call)
+		if interrupt != nil {
+			return nil, nil, nil, interrupt, call, nil
+		}
+		if err != nil {
+			if spec.ContinueOnError {
+				results[index] = ErrorResult(call, err)
+				filled[index] = true
+				continue
+			}
+			return nil, nil, nil, nil, call, err
+		}
+		prepared = append(prepared, preparedCall{
+			Index: index,
+			Call:  call,
+			Item:  item,
+		})
+	}
+	return prepared, results, filled, nil, Call{}, nil
+}
+
+type preparedOutcome struct {
+	Index  int
+	Call   Call
+	Result Result
+	Error  error
+}
+
+func executePreparedCallsParallel[S any](ctx context.Context, spec parallelRunSpec[S], prepared []preparedCall, results []Result, filled []bool) ([]Result, []bool, Call, error) {
+	if len(prepared) == 0 {
+		return results, filled, Call{}, nil
+	}
+
+	execCtx := ctx
+	cancel := func() {}
+	if !spec.ContinueOnError {
+		execCtx, cancel = context.WithCancel(ctx)
+	}
+	defer cancel()
+
+	outcomes := make(chan preparedOutcome, len(prepared))
+	sem := make(chan struct{}, spec.MaxConcurrency)
+	var wg sync.WaitGroup
+	var firstMu sync.Mutex
+	var firstErr error
+	var firstCall Call
+
+	setFirstError := func(call Call, err error) {
+		if err == nil {
+			return
+		}
+		firstMu.Lock()
+		defer firstMu.Unlock()
+		if firstErr == nil {
+			firstErr = err
+			firstCall = call
+			if !spec.ContinueOnError {
+				cancel()
+			}
+		}
+	}
+
+	for _, preparedCall := range prepared {
+		preparedCall := preparedCall
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-execCtx.Done():
+				setFirstError(preparedCall.Call, execCtx.Err())
+				outcomes <- preparedOutcome{Index: preparedCall.Index, Call: preparedCall.Call, Error: execCtx.Err()}
+				return
+			}
+			if err := execCtx.Err(); err != nil {
+				setFirstError(preparedCall.Call, err)
+				outcomes <- preparedOutcome{Index: preparedCall.Index, Call: preparedCall.Call, Error: err}
+				return
+			}
+			result, err := executePreparedCall(execCtx, spec.NodeID, spec.Metadata, spec.ProgressInterval, preparedCall.Item, preparedCall.Call)
+			if err != nil {
+				setFirstError(preparedCall.Call, err)
+			}
+			outcomes <- preparedOutcome{
+				Index:  preparedCall.Index,
+				Call:   preparedCall.Call,
+				Result: result,
+				Error:  err,
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(outcomes)
+
+	for outcome := range outcomes {
+		if outcome.Error != nil {
+			if spec.ContinueOnError {
+				results[outcome.Index] = ErrorResult(outcome.Call, outcome.Error)
+				filled[outcome.Index] = true
+			}
+			continue
+		}
+		results[outcome.Index] = outcome.Result
+		filled[outcome.Index] = true
+	}
+
+	if !spec.ContinueOnError {
+		firstMu.Lock()
+		defer firstMu.Unlock()
+		return results, filled, firstCall, firstErr
+	}
+
+	return results, filled, Call{}, nil
+}
+
+func compactResults(results []Result, filled []bool) []Result {
+	if len(results) == 0 {
+		return nil
+	}
+	compacted := make([]Result, 0, len(results))
+	for index, result := range results {
+		if len(filled) == 0 || filled[index] {
+			compacted = append(compacted, result)
+		}
+	}
+	return compacted
 }
 
 func applyAfterToolAdjuster(ctx context.Context, nodeID string, metadata map[string]string, call Call, result Result) (Result, *trace.EventContext, error) {

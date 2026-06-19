@@ -516,6 +516,59 @@ func TestServerWebSocketReceivesToolProgressEvent(t *testing.T) {
 	}
 }
 
+func TestServerWebSocketFiltersEventsBySessionID(t *testing.T) {
+	app := buildServerTestApp(t, true, "")
+	server, err := app.Server(api.WithConfigDir(t.TempDir()), api.WithOutput(io.Discard))
+	if err != nil {
+		t.Fatalf("Server() error = %v", err)
+	}
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/events?token=" + server.Token() + "&session_id=session_keep"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("Dial error = %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	invoke := func(sessionID string, runID string, value string) {
+		t.Helper()
+		body, err := json.Marshal(map[string]any{
+			"state":      serverState{Value: value},
+			"run_id":     runID,
+			"session_id": sessionID,
+		})
+		if err != nil {
+			t.Fatalf("Marshal invoke body: %v", err)
+		}
+		req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/runs/server.workflow/invoke", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("NewRequest(invoke) error = %v", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+server.Token())
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("Do(invoke) error = %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("invoke status = %d body=%s", resp.StatusCode, body)
+		}
+	}
+
+	invoke("session_drop", "run_drop", "drop")
+	invoke("session_keep", "run_keep", "keep")
+
+	event := readWebSocketEvent(t, ctx, conn, trace.EventRunStarted)
+	if event.SessionID != "session_keep" || event.RunID != "run_keep" {
+		t.Fatalf("filtered event = %#v, want session_keep/run_keep", event)
+	}
+}
+
 func TestServerResumeUsesCallerProvidedState(t *testing.T) {
 	app := buildResumeServerTestApp(t)
 	firstServer, err := app.Server(api.WithOutput(io.Discard))
