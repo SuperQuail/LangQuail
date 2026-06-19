@@ -162,3 +162,67 @@ func TestOpenAIProviderMapsToolCalls(t *testing.T) {
 		t.Fatalf("cached usage = %#v", response.Usage)
 	}
 }
+
+func TestOpenAIProviderMapsImageInput(t *testing.T) {
+	handlerErrors := testutil.NewHandlerErrors(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			handlerErrors.Failf(w, "decode request: %v", err)
+			return
+		}
+		messages, ok := body["messages"].([]any)
+		if !ok || len(messages) != 1 {
+			handlerErrors.Failf(w, "messages = %#v", body["messages"])
+			return
+		}
+		message := messages[0].(map[string]any)
+		if message["role"] != "user" {
+			handlerErrors.Failf(w, "message = %#v", message)
+			return
+		}
+		content, ok := message["content"].([]any)
+		if !ok || len(content) != 2 {
+			handlerErrors.Failf(w, "content = %#v", message["content"])
+			return
+		}
+		text := content[0].(map[string]any)
+		if text["type"] != "text" || text["text"] != "describe this" {
+			handlerErrors.Failf(w, "text part = %#v", text)
+			return
+		}
+		image := content[1].(map[string]any)
+		imageURL := image["image_url"].(map[string]any)
+		if image["type"] != "image_url" || imageURL["url"] != "data:image/png;base64,AQI=" {
+			handlerErrors.Failf(w, "image part = %#v", image)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"chatcmpl_image",
+			"object":"chat.completion",
+			"created":1,
+			"model":"test-model",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}
+		}`))
+	}))
+	defer server.Close()
+
+	provider := lqopenai.Provider("openai").APIKey("test-key").BaseURL(server.URL)
+	response, err := provider.Chat(context.Background(), llm.Request{
+		Model: "test-model",
+		Messages: []llm.Message{llm.UserInput(
+			llm.InputText("describe this"),
+			llm.InputImageData("image/png", []byte{1, 2}),
+		)},
+	})
+	if err != nil {
+		handlerErrors.AssertNone()
+		t.Fatalf("Chat() error = %v", err)
+	}
+	handlerErrors.AssertNone()
+	if response.Text != "ok" {
+		t.Fatalf("text = %q", response.Text)
+	}
+}

@@ -2,6 +2,7 @@ package gemini
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -131,13 +132,15 @@ func convertMessages(messages []token.Message) ([]*genai.Content, *genai.Content
 	for _, message := range messages {
 		switch message.Role {
 		case "system", "developer":
-			if message.Content != "" {
-				systemParts = append(systemParts, genai.NewPartFromText(message.Content))
+			parts, err := convertMessageParts(message)
+			if err != nil {
+				return nil, nil, err
 			}
+			systemParts = append(systemParts, parts...)
 		case "assistant":
-			parts := make([]*genai.Part, 0, len(message.ToolCalls)+1)
-			if message.Content != "" {
-				parts = append(parts, genai.NewPartFromText(message.Content))
+			parts, err := convertMessageParts(message)
+			if err != nil {
+				return nil, nil, err
 			}
 			for _, call := range message.ToolCalls {
 				toolNames[call.ID] = call.Name
@@ -151,6 +154,9 @@ func convertMessages(messages []token.Message) ([]*genai.Content, *genai.Content
 				contents = append(contents, &genai.Content{Role: genai.RoleModel, Parts: parts})
 			}
 		case "tool":
+			if hasImageInput(message) {
+				return nil, nil, fmt.Errorf("token/gemini: image parts cannot be encoded in tool result messages")
+			}
 			name := message.Name
 			if name == "" {
 				name = toolNames[message.ToolCallID]
@@ -169,8 +175,12 @@ func convertMessages(messages []token.Message) ([]*genai.Content, *genai.Content
 				}},
 			})
 		default:
-			if message.Content != "" {
-				contents = append(contents, genai.NewContentFromText(message.Content, genai.RoleUser))
+			parts, err := convertMessageParts(message)
+			if err != nil {
+				return nil, nil, err
+			}
+			if len(parts) > 0 {
+				contents = append(contents, &genai.Content{Role: genai.RoleUser, Parts: parts})
 			}
 		}
 	}
@@ -178,6 +188,92 @@ func convertMessages(messages []token.Message) ([]*genai.Content, *genai.Content
 		return contents, nil, nil
 	}
 	return contents, &genai.Content{Parts: systemParts}, nil
+}
+
+func convertMessageParts(message token.Message) ([]*genai.Part, error) {
+	if len(message.Input) == 0 {
+		if message.Content == "" {
+			return nil, nil
+		}
+		return []*genai.Part{genai.NewPartFromText(message.Content)}, nil
+	}
+	parts := make([]*genai.Part, 0, len(message.Input))
+	for _, part := range message.Input {
+		switch part.Type {
+		case token.InputPartText:
+			if part.Text != "" {
+				parts = append(parts, genai.NewPartFromText(part.Text))
+			}
+		case token.InputPartImage:
+			converted, err := convertImagePart(part.Image)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, converted)
+		default:
+			return nil, fmt.Errorf("token/gemini: unsupported input part type %q", part.Type)
+		}
+	}
+	if len(parts) == 0 && message.Content != "" {
+		parts = append(parts, genai.NewPartFromText(message.Content))
+	}
+	return parts, nil
+}
+
+func convertImagePart(image *token.InputImage) (*genai.Part, error) {
+	if image == nil {
+		return nil, fmt.Errorf("token/gemini: image input is missing image data")
+	}
+	if image.URL != "" {
+		if mimeType, data, ok, err := parseImageDataURL(image.URL); err != nil {
+			return nil, err
+		} else if ok {
+			return genai.NewPartFromBytes(data, mimeType), nil
+		}
+		if image.MIMEType == "" {
+			return nil, fmt.Errorf("token/gemini: image url requires mime type")
+		}
+		return genai.NewPartFromURI(image.URL, image.MIMEType), nil
+	}
+	if len(image.Data) == 0 {
+		return nil, fmt.Errorf("token/gemini: image input requires url or data")
+	}
+	if image.MIMEType == "" {
+		return nil, fmt.Errorf("token/gemini: image data requires mime type")
+	}
+	return genai.NewPartFromBytes(image.Data, image.MIMEType), nil
+}
+
+func parseImageDataURL(value string) (string, []byte, bool, error) {
+	if !strings.HasPrefix(value, "data:") {
+		return "", nil, false, nil
+	}
+	comma := strings.IndexByte(value, ',')
+	if comma < 0 {
+		return "", nil, true, fmt.Errorf("token/gemini: invalid image data url")
+	}
+	metadata := value[len("data:"):comma]
+	if !strings.Contains(metadata, ";base64") {
+		return "", nil, true, fmt.Errorf("token/gemini: image data url must be base64 encoded")
+	}
+	mediaType := strings.Split(metadata, ";")[0]
+	if mediaType == "" {
+		return "", nil, true, fmt.Errorf("token/gemini: image data url requires mime type")
+	}
+	data, err := base64.StdEncoding.DecodeString(value[comma+1:])
+	if err != nil {
+		return "", nil, true, fmt.Errorf("token/gemini: decode image data url: %w", err)
+	}
+	return mediaType, data, true, nil
+}
+
+func hasImageInput(message token.Message) bool {
+	for _, part := range message.Input {
+		if part.Type == token.InputPartImage {
+			return true
+		}
+	}
+	return false
 }
 
 func decodeObjectOrRaw(raw json.RawMessage) map[string]any {

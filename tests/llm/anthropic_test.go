@@ -229,6 +229,121 @@ func TestAnthropicProviderMapsReasoningEffort(t *testing.T) {
 	}
 }
 
+func TestAnthropicProviderMapsImageInput(t *testing.T) {
+	handlerErrors := testutil.NewHandlerErrors(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			handlerErrors.Failf(w, "decode request: %v", err)
+			return
+		}
+		messages, ok := body["messages"].([]any)
+		if !ok || len(messages) != 1 {
+			handlerErrors.Failf(w, "messages = %#v", body["messages"])
+			return
+		}
+		message := messages[0].(map[string]any)
+		if message["role"] != "user" {
+			handlerErrors.Failf(w, "message = %#v", message)
+			return
+		}
+		contentJSON, _ := json.Marshal(message["content"])
+		for _, want := range []string{"describe this", "image", "base64", "image/png", "AQI="} {
+			if !strings.Contains(string(contentJSON), want) {
+				handlerErrors.Failf(w, "content = %s, want %q", contentJSON, want)
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"msg_image",
+			"type":"message",
+			"role":"assistant",
+			"model":"claude-test",
+			"content":[{"type":"text","text":"ok"}],
+			"stop_reason":"end_turn",
+			"usage":{"input_tokens":3,"output_tokens":1}
+		}`))
+	}))
+	defer server.Close()
+
+	provider := lqanthropic.Provider("claude").APIKey("test-key").BaseURL(server.URL)
+	response, err := provider.Chat(context.Background(), llm.Request{
+		Model: "claude-test",
+		Messages: []llm.Message{llm.UserInput(
+			llm.InputText("describe this"),
+			llm.InputImageData("image/png", []byte{1, 2}),
+		)},
+	})
+	if err != nil {
+		handlerErrors.AssertNone()
+		t.Fatalf("Chat() error = %v", err)
+	}
+	handlerErrors.AssertNone()
+	if response.Text != "ok" {
+		t.Fatalf("text = %q", response.Text)
+	}
+}
+
+func TestAnthropicProviderMapsAssistantImageInput(t *testing.T) {
+	handlerErrors := testutil.NewHandlerErrors(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			handlerErrors.Failf(w, "decode request: %v", err)
+			return
+		}
+		messages, ok := body["messages"].([]any)
+		if !ok || len(messages) != 2 {
+			handlerErrors.Failf(w, "messages = %#v", body["messages"])
+			return
+		}
+		assistant := messages[1].(map[string]any)
+		if assistant["role"] != "assistant" {
+			handlerErrors.Failf(w, "assistant message = %#v", assistant)
+			return
+		}
+		contentJSON, _ := json.Marshal(assistant["content"])
+		for _, want := range []string{"generated image", "image", "base64", "image/png", "AwQ="} {
+			if !strings.Contains(string(contentJSON), want) {
+				handlerErrors.Failf(w, "assistant content = %s, want %q", contentJSON, want)
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"msg_assistant_image",
+			"type":"message",
+			"role":"assistant",
+			"model":"claude-test",
+			"content":[{"type":"text","text":"ok"}],
+			"stop_reason":"end_turn",
+			"usage":{"input_tokens":3,"output_tokens":1}
+		}`))
+	}))
+	defer server.Close()
+
+	provider := lqanthropic.Provider("claude").APIKey("test-key").BaseURL(server.URL)
+	response, err := provider.Chat(context.Background(), llm.Request{
+		Model: "claude-test",
+		Messages: []llm.Message{
+			llm.User("start"),
+			llm.AssistantInput(
+				llm.InputText("generated image"),
+				llm.InputImageData("image/png", []byte{3, 4}),
+			),
+		},
+	})
+	if err != nil {
+		handlerErrors.AssertNone()
+		t.Fatalf("Chat() error = %v", err)
+	}
+	handlerErrors.AssertNone()
+	if response.Text != "ok" {
+		t.Fatalf("text = %q", response.Text)
+	}
+}
+
 func TestAnthropicProviderMapsDisabledThinkingWithEffort(t *testing.T) {
 	handlerErrors := testutil.NewHandlerErrors(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

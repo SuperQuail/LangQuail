@@ -40,7 +40,7 @@ func TestGeminiEstimatorCountPromptTokensMapsGenerateContentRequest(t *testing.T
 			return
 		}
 		contentsJSON, _ := json.Marshal(generateRequest["contents"])
-		for _, want := range []string{"search", "functionCall", "call_prev", "functionResponse", "old result"} {
+		for _, want := range []string{"search", "previous lookup", "inlineData", "image/png", "AQI=", "functionCall", "call_prev", "functionResponse", "old result"} {
 			if !strings.Contains(string(contentsJSON), want) {
 				handlerErrors.Failf(w, "contents = %s, want %q", contentsJSON, want)
 				return
@@ -66,7 +66,10 @@ func TestGeminiEstimatorCountPromptTokensMapsGenerateContentRequest(t *testing.T
 			{Role: "system", Content: "system rules"},
 			{Role: "developer", Content: "developer rules"},
 			{Role: "user", Content: "search"},
-			{Role: "assistant", Content: "previous lookup", ToolCalls: []token.ToolCall{{
+			{Role: "assistant", Input: []token.InputPart{
+				{Type: token.InputPartText, Text: "previous lookup"},
+				{Type: token.InputPartImage, Image: &token.InputImage{MIMEType: "image/png", Data: []byte{1, 2}}},
+			}, ToolCalls: []token.ToolCall{{
 				ID:        "call_prev",
 				Name:      "lookup",
 				Arguments: json.RawMessage(`{"q":"old"}`),

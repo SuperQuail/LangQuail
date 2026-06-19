@@ -2,6 +2,7 @@ package responses
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -68,11 +69,15 @@ func (p *ProviderAdapter) Chat(ctx context.Context, request llm.Request) (llm.Re
 		opts = append(opts, option.WithBaseURL(p.baseURL))
 	}
 	client := sdkopenai.NewClient(opts...)
+	input, err := convertInput(request.Messages)
+	if err != nil {
+		return llm.Response{}, err
+	}
 
 	params := sdkresponses.ResponseNewParams{
 		Model: shared.ResponsesModel(request.Model),
 		Input: sdkresponses.ResponseNewParamsInputUnion{
-			OfInputItemList: convertInput(request.Messages),
+			OfInputItemList: input,
 		},
 		Tools: convertTools(request.Tools),
 	}
@@ -134,11 +139,15 @@ func (p *ProviderAdapter) ChatStream(ctx context.Context, request llm.Request, h
 		opts = append(opts, option.WithBaseURL(p.baseURL))
 	}
 	client := sdkopenai.NewClient(opts...)
+	input, err := convertInput(request.Messages)
+	if err != nil {
+		return llm.Response{}, err
+	}
 
 	params := sdkresponses.ResponseNewParams{
 		Model: shared.ResponsesModel(request.Model),
 		Input: sdkresponses.ResponseNewParamsInputUnion{
-			OfInputItemList: convertInput(request.Messages),
+			OfInputItemList: input,
 		},
 		Tools: convertTools(request.Tools),
 	}
@@ -270,25 +279,109 @@ func openAIReasoningEffort(config *llm.ReasoningConfig) string {
 	return strings.ToLower(strings.TrimSpace(config.Effort))
 }
 
-func convertInput(messages []llm.Message) sdkresponses.ResponseInputParam {
+func convertInput(messages []llm.Message) (sdkresponses.ResponseInputParam, error) {
 	result := make(sdkresponses.ResponseInputParam, 0, len(messages))
 	for _, message := range messages {
 		switch message.Role {
 		case llm.RoleSystem:
+			if hasImageInput(message) {
+				return nil, fmt.Errorf("llm/openai/responses: image input is only supported for user messages")
+			}
 			result = append(result, sdkresponses.ResponseInputItemParamOfMessage(message.Content, sdkresponses.EasyInputMessageRoleSystem))
 		case llm.RoleDeveloper:
+			if hasImageInput(message) {
+				return nil, fmt.Errorf("llm/openai/responses: image input is only supported for user messages")
+			}
 			result = append(result, sdkresponses.ResponseInputItemParamOfMessage(message.Content, sdkresponses.EasyInputMessageRoleDeveloper))
 		case llm.RoleUser:
-			result = append(result, sdkresponses.ResponseInputItemParamOfMessage(message.Content, sdkresponses.EasyInputMessageRoleUser))
+			converted, err := convertUserMessage(message)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, converted)
 		case llm.RoleTool:
+			if hasImageInput(message) {
+				return nil, fmt.Errorf("llm/openai/responses: image input is only supported for user messages")
+			}
 			result = append(result, sdkresponses.ResponseInputItemParamOfFunctionCallOutput(message.ToolCallID, message.Content))
 		case llm.RoleAssistant:
+			if hasImageInput(message) {
+				return nil, fmt.Errorf("llm/openai/responses: image input is only supported for user messages")
+			}
 			result = appendAssistantMessage(result, message)
 		default:
+			if hasImageInput(message) {
+				return nil, fmt.Errorf("llm/openai/responses: image input is only supported for user messages")
+			}
 			result = append(result, sdkresponses.ResponseInputItemParamOfMessage(message.Content, sdkresponses.EasyInputMessageRoleUser))
 		}
 	}
-	return result
+	return result, nil
+}
+
+func convertUserMessage(message llm.Message) (sdkresponses.ResponseInputItemUnionParam, error) {
+	if len(message.Input) == 0 {
+		return sdkresponses.ResponseInputItemParamOfMessage(message.Content, sdkresponses.EasyInputMessageRoleUser), nil
+	}
+	content, err := convertInputParts(message.Input)
+	if err != nil {
+		return sdkresponses.ResponseInputItemUnionParam{}, err
+	}
+	if len(content) == 0 {
+		return sdkresponses.ResponseInputItemParamOfMessage(message.Content, sdkresponses.EasyInputMessageRoleUser), nil
+	}
+	return sdkresponses.ResponseInputItemParamOfMessage(content, sdkresponses.EasyInputMessageRoleUser), nil
+}
+
+func convertInputParts(parts []llm.InputPart) (sdkresponses.ResponseInputMessageContentListParam, error) {
+	result := make(sdkresponses.ResponseInputMessageContentListParam, 0, len(parts))
+	for _, part := range parts {
+		switch part.Type {
+		case llm.InputPartText:
+			if part.Text != "" {
+				result = append(result, sdkresponses.ResponseInputContentParamOfInputText(part.Text))
+			}
+		case llm.InputPartImage:
+			url, err := inputImageURL(part.Image)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, sdkresponses.ResponseInputContentUnionParam{
+				OfInputImage: &sdkresponses.ResponseInputImageParam{
+					Detail:   sdkresponses.ResponseInputImageDetailAuto,
+					ImageURL: sdkopenai.String(url),
+				},
+			})
+		default:
+			return nil, fmt.Errorf("llm/openai/responses: unsupported input part type %q", part.Type)
+		}
+	}
+	return result, nil
+}
+
+func inputImageURL(image *llm.InputImage) (string, error) {
+	if image == nil {
+		return "", fmt.Errorf("llm/openai/responses: image input is missing image data")
+	}
+	if image.URL != "" {
+		return image.URL, nil
+	}
+	if len(image.Data) == 0 {
+		return "", fmt.Errorf("llm/openai/responses: image input requires url or data")
+	}
+	if image.MIMEType == "" {
+		return "", fmt.Errorf("llm/openai/responses: image data requires mime type")
+	}
+	return "data:" + image.MIMEType + ";base64," + base64.StdEncoding.EncodeToString(image.Data), nil
+}
+
+func hasImageInput(message llm.Message) bool {
+	for _, part := range message.Input {
+		if part.Type == llm.InputPartImage {
+			return true
+		}
+	}
+	return false
 }
 
 // Responses API 需要把上一轮工具调用和工具结果都还原成 input item，agent loop 才能继续推理。

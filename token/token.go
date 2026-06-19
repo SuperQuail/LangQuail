@@ -15,11 +15,31 @@ const (
 )
 
 type Message struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content,omitempty"`
-	Name       string     `json:"name,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	Role       string      `json:"role"`
+	Content    string      `json:"content,omitempty"`
+	Input      []InputPart `json:"input,omitempty"`
+	Name       string      `json:"name,omitempty"`
+	ToolCallID string      `json:"tool_call_id,omitempty"`
+	ToolCalls  []ToolCall  `json:"tool_calls,omitempty"`
+}
+
+type InputPartType string
+
+const (
+	InputPartText  InputPartType = "input_text"
+	InputPartImage InputPartType = "input_image"
+)
+
+type InputPart struct {
+	Type  InputPartType `json:"type"`
+	Text  string        `json:"text,omitempty"`
+	Image *InputImage   `json:"image,omitempty"`
+}
+
+type InputImage struct {
+	URL      string `json:"url,omitempty"`
+	Data     []byte `json:"data,omitempty"`
+	MIMEType string `json:"mime_type,omitempty"`
 }
 
 type ToolCall struct {

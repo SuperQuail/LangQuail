@@ -189,6 +189,133 @@ func contentContainsText(content map[string]any, want string) bool {
 	return false
 }
 
+func TestGeminiProviderMapsImageInput(t *testing.T) {
+	handlerErrors := testutil.NewHandlerErrors(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			handlerErrors.Failf(w, "decode request: %v", err)
+			return
+		}
+		contents, ok := body["contents"].([]any)
+		if !ok || len(contents) != 1 {
+			handlerErrors.Failf(w, "contents = %#v", body["contents"])
+			return
+		}
+		message := contents[0].(map[string]any)
+		if message["role"] != "user" {
+			handlerErrors.Failf(w, "message = %#v", message)
+			return
+		}
+		parts, ok := message["parts"].([]any)
+		if !ok || len(parts) != 2 {
+			handlerErrors.Failf(w, "parts = %#v", message["parts"])
+			return
+		}
+		text := parts[0].(map[string]any)
+		if text["text"] != "describe this" {
+			handlerErrors.Failf(w, "text part = %#v", text)
+			return
+		}
+		image := parts[1].(map[string]any)
+		inline := image["inlineData"].(map[string]any)
+		if inline["mimeType"] != "image/png" || inline["data"] != "AQI=" {
+			handlerErrors.Failf(w, "image part = %#v", image)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"responseId":"gemini_image",
+			"modelVersion":"models/test-model-version",
+			"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}],
+			"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":1,"totalTokenCount":4}
+		}`))
+	}))
+	defer server.Close()
+
+	provider := lqgemini.Provider("gemini").APIKey("test-key").BaseURL(server.URL)
+	response, err := provider.Chat(context.Background(), llm.Request{
+		Model: "test-model",
+		Messages: []llm.Message{llm.UserInput(
+			llm.InputText("describe this"),
+			llm.InputImageData("image/png", []byte{1, 2}),
+		)},
+	})
+	if err != nil {
+		handlerErrors.AssertNone()
+		t.Fatalf("Chat() error = %v", err)
+	}
+	handlerErrors.AssertNone()
+	if response.Text != "ok" {
+		t.Fatalf("text = %q", response.Text)
+	}
+}
+
+func TestGeminiProviderMapsAssistantImageInput(t *testing.T) {
+	handlerErrors := testutil.NewHandlerErrors(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			handlerErrors.Failf(w, "decode request: %v", err)
+			return
+		}
+		contents, ok := body["contents"].([]any)
+		if !ok || len(contents) != 2 {
+			handlerErrors.Failf(w, "contents = %#v", body["contents"])
+			return
+		}
+		assistant := contents[1].(map[string]any)
+		if assistant["role"] != "model" {
+			handlerErrors.Failf(w, "assistant message = %#v", assistant)
+			return
+		}
+		parts, ok := assistant["parts"].([]any)
+		if !ok || len(parts) != 2 {
+			handlerErrors.Failf(w, "assistant parts = %#v", assistant["parts"])
+			return
+		}
+		text := parts[0].(map[string]any)
+		if text["text"] != "generated image" {
+			handlerErrors.Failf(w, "text part = %#v", text)
+			return
+		}
+		image := parts[1].(map[string]any)
+		inline := image["inlineData"].(map[string]any)
+		if inline["mimeType"] != "image/png" || inline["data"] != "AwQ=" {
+			handlerErrors.Failf(w, "image part = %#v", image)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"responseId":"gemini_assistant_image",
+			"modelVersion":"models/test-model-version",
+			"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}],
+			"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":1,"totalTokenCount":4}
+		}`))
+	}))
+	defer server.Close()
+
+	provider := lqgemini.Provider("gemini").APIKey("test-key").BaseURL(server.URL)
+	response, err := provider.Chat(context.Background(), llm.Request{
+		Model: "test-model",
+		Messages: []llm.Message{
+			llm.User("start"),
+			llm.AssistantInput(
+				llm.InputText("generated image"),
+				llm.InputImageData("image/png", []byte{3, 4}),
+			),
+		},
+	})
+	if err != nil {
+		handlerErrors.AssertNone()
+		t.Fatalf("Chat() error = %v", err)
+	}
+	handlerErrors.AssertNone()
+	if response.Text != "ok" {
+		t.Fatalf("text = %q", response.Text)
+	}
+}
+
 func TestGeminiProviderChatStreamMapsTextThinkingToolCallsAndUsage(t *testing.T) {
 	handlerErrors := testutil.NewHandlerErrors(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

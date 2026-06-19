@@ -3,6 +3,7 @@ package anthropic
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -68,7 +69,10 @@ func (p *ProviderAdapter) Chat(ctx context.Context, request llm.Request) (llm.Re
 	}
 	client := sdkanthropic.NewClient(opts...)
 
-	messages, system := convertMessages(request.Messages)
+	messages, system, err := convertMessages(request.Messages)
+	if err != nil {
+		return llm.Response{}, err
+	}
 	maxTokens := request.MaxTokens
 	if maxTokens <= 0 {
 		maxTokens = 1024
@@ -131,7 +135,10 @@ func (p *ProviderAdapter) ChatStream(ctx context.Context, request llm.Request, h
 	}
 	client := sdkanthropic.NewClient(opts...)
 
-	messages, system := convertMessages(request.Messages)
+	messages, system, err := convertMessages(request.Messages)
+	if err != nil {
+		return llm.Response{}, err
+	}
 	maxTokens := request.MaxTokens
 	if maxTokens <= 0 {
 		maxTokens = 1024
@@ -212,30 +219,185 @@ func (p *ProviderAdapter) ChatStream(ctx context.Context, request llm.Request, h
 	}, nil
 }
 
-func convertMessages(messages []llm.Message) ([]sdkanthropic.MessageParam, []sdkanthropic.TextBlockParam) {
+func convertMessages(messages []llm.Message) ([]sdkanthropic.MessageParam, []sdkanthropic.TextBlockParam, error) {
 	result := make([]sdkanthropic.MessageParam, 0, len(messages))
 	var system []sdkanthropic.TextBlockParam
 	for _, message := range messages {
 		switch message.Role {
 		case llm.RoleSystem, llm.RoleDeveloper:
-			system = append(system, sdkanthropic.TextBlockParam{Text: message.Content})
+			blocks, err := convertSystemBlocks(message)
+			if err != nil {
+				return nil, nil, err
+			}
+			system = append(system, blocks...)
 		case llm.RoleAssistant:
-			result = append(result, sdkanthropic.NewAssistantMessage(convertAssistantBlocks(message)...))
+			blocks, err := convertAssistantBlocks(message)
+			if err != nil {
+				return nil, nil, err
+			}
+			result = append(result, sdkanthropic.NewAssistantMessage(blocks...))
 		case llm.RoleTool:
-			result = append(result, sdkanthropic.NewUserMessage(
-				sdkanthropic.NewToolResultBlock(message.ToolCallID, message.Content, false),
-			))
+			block, err := convertToolResultBlock(message)
+			if err != nil {
+				return nil, nil, err
+			}
+			result = append(result, sdkanthropic.NewUserMessage(block))
 		default:
-			result = append(result, sdkanthropic.NewUserMessage(sdkanthropic.NewTextBlock(message.Content)))
+			blocks, err := convertContentBlocks(message)
+			if err != nil {
+				return nil, nil, err
+			}
+			result = append(result, sdkanthropic.NewUserMessage(blocks...))
 		}
 	}
-	return result, system
+	return result, system, nil
 }
 
-func convertAssistantBlocks(message llm.Message) []sdkanthropic.ContentBlockParamUnion {
-	blocks := make([]sdkanthropic.ContentBlockParamUnion, 0, len(message.ToolCalls)+1)
-	if message.Content != "" {
-		blocks = append(blocks, sdkanthropic.NewTextBlock(message.Content))
+func convertSystemBlocks(message llm.Message) ([]sdkanthropic.TextBlockParam, error) {
+	if len(message.Input) == 0 {
+		if message.Content == "" {
+			return nil, nil
+		}
+		return []sdkanthropic.TextBlockParam{{Text: message.Content}}, nil
+	}
+	blocks := make([]sdkanthropic.TextBlockParam, 0, len(message.Input))
+	for _, part := range message.Input {
+		switch part.Type {
+		case llm.InputPartText:
+			if part.Text != "" {
+				blocks = append(blocks, sdkanthropic.TextBlockParam{Text: part.Text})
+			}
+		case llm.InputPartImage:
+			return nil, fmt.Errorf("llm/anthropic: image parts cannot be encoded in system or developer messages")
+		default:
+			return nil, fmt.Errorf("llm/anthropic: unsupported input part type %q", part.Type)
+		}
+	}
+	if len(blocks) == 0 && message.Content != "" {
+		blocks = append(blocks, sdkanthropic.TextBlockParam{Text: message.Content})
+	}
+	return blocks, nil
+}
+
+func convertContentBlocks(message llm.Message) ([]sdkanthropic.ContentBlockParamUnion, error) {
+	if len(message.Input) == 0 {
+		if message.Content == "" {
+			return nil, nil
+		}
+		return []sdkanthropic.ContentBlockParamUnion{sdkanthropic.NewTextBlock(message.Content)}, nil
+	}
+	blocks := make([]sdkanthropic.ContentBlockParamUnion, 0, len(message.Input))
+	for _, part := range message.Input {
+		switch part.Type {
+		case llm.InputPartText:
+			if part.Text != "" {
+				blocks = append(blocks, sdkanthropic.NewTextBlock(part.Text))
+			}
+		case llm.InputPartImage:
+			block, err := convertImageBlock(part.Image)
+			if err != nil {
+				return nil, err
+			}
+			blocks = append(blocks, block)
+		default:
+			return nil, fmt.Errorf("llm/anthropic: unsupported input part type %q", part.Type)
+		}
+	}
+	if len(blocks) == 0 {
+		if message.Content == "" {
+			return nil, nil
+		}
+		return []sdkanthropic.ContentBlockParamUnion{sdkanthropic.NewTextBlock(message.Content)}, nil
+	}
+	return blocks, nil
+}
+
+func convertImageBlock(image *llm.InputImage) (sdkanthropic.ContentBlockParamUnion, error) {
+	if image == nil {
+		return sdkanthropic.ContentBlockParamUnion{}, fmt.Errorf("llm/anthropic: image input is missing image data")
+	}
+	if image.URL != "" {
+		if mimeType, data, ok, err := parseImageDataURL(image.URL); err != nil {
+			return sdkanthropic.ContentBlockParamUnion{}, err
+		} else if ok {
+			return sdkanthropic.NewImageBlock(sdkanthropic.Base64ImageSourceParam{
+				Data:      data,
+				MediaType: sdkanthropic.Base64ImageSourceMediaType(mimeType),
+			}), nil
+		}
+		return sdkanthropic.NewImageBlock(sdkanthropic.URLImageSourceParam{URL: image.URL}), nil
+	}
+	if len(image.Data) == 0 {
+		return sdkanthropic.ContentBlockParamUnion{}, fmt.Errorf("llm/anthropic: image input requires url or data")
+	}
+	if image.MIMEType == "" {
+		return sdkanthropic.ContentBlockParamUnion{}, fmt.Errorf("llm/anthropic: image data requires mime type")
+	}
+	return sdkanthropic.NewImageBlock(sdkanthropic.Base64ImageSourceParam{
+		Data:      base64.StdEncoding.EncodeToString(image.Data),
+		MediaType: sdkanthropic.Base64ImageSourceMediaType(image.MIMEType),
+	}), nil
+}
+
+func parseImageDataURL(value string) (string, string, bool, error) {
+	if !strings.HasPrefix(value, "data:") {
+		return "", "", false, nil
+	}
+	comma := strings.IndexByte(value, ',')
+	if comma < 0 {
+		return "", "", true, fmt.Errorf("llm/anthropic: invalid image data url")
+	}
+	metadata := value[len("data:"):comma]
+	data := value[comma+1:]
+	if !strings.Contains(metadata, ";base64") {
+		return "", "", true, fmt.Errorf("llm/anthropic: image data url must be base64 encoded")
+	}
+	mediaType := strings.Split(metadata, ";")[0]
+	if mediaType == "" {
+		return "", "", true, fmt.Errorf("llm/anthropic: image data url requires mime type")
+	}
+	return mediaType, data, true, nil
+}
+
+func convertToolResultBlock(message llm.Message) (sdkanthropic.ContentBlockParamUnion, error) {
+	if len(message.Input) == 0 {
+		return sdkanthropic.NewToolResultBlock(message.ToolCallID, message.Content, false), nil
+	}
+	content := make([]sdkanthropic.ToolResultBlockParamContentUnion, 0, len(message.Input))
+	for _, part := range message.Input {
+		switch part.Type {
+		case llm.InputPartText:
+			if part.Text != "" {
+				content = append(content, sdkanthropic.ToolResultBlockParamContentUnion{
+					OfText: &sdkanthropic.TextBlockParam{Text: part.Text},
+				})
+			}
+		case llm.InputPartImage:
+			block, err := convertImageBlock(part.Image)
+			if err != nil {
+				return sdkanthropic.ContentBlockParamUnion{}, err
+			}
+			content = append(content, sdkanthropic.ToolResultBlockParamContentUnion{OfImage: block.OfImage})
+		default:
+			return sdkanthropic.ContentBlockParamUnion{}, fmt.Errorf("llm/anthropic: unsupported input part type %q", part.Type)
+		}
+	}
+	if len(content) == 0 && message.Content != "" {
+		content = append(content, sdkanthropic.ToolResultBlockParamContentUnion{
+			OfText: &sdkanthropic.TextBlockParam{Text: message.Content},
+		})
+	}
+	return sdkanthropic.ContentBlockParamUnion{OfToolResult: &sdkanthropic.ToolResultBlockParam{
+		ToolUseID: message.ToolCallID,
+		Content:   content,
+		IsError:   sdkanthropic.Bool(false),
+	}}, nil
+}
+
+func convertAssistantBlocks(message llm.Message) ([]sdkanthropic.ContentBlockParamUnion, error) {
+	blocks, err := convertContentBlocks(message)
+	if err != nil {
+		return nil, err
 	}
 	for _, call := range message.ToolCalls {
 		var input any
@@ -246,7 +408,7 @@ func convertAssistantBlocks(message llm.Message) []sdkanthropic.ContentBlockPara
 		}
 		blocks = append(blocks, sdkanthropic.NewToolUseBlock(call.ID, input, call.Name))
 	}
-	return blocks
+	return blocks, nil
 }
 
 func convertTools(tools []llm.ToolSpec) []sdkanthropic.ToolUnionParam {

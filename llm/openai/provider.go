@@ -2,6 +2,7 @@ package openai
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -68,10 +69,14 @@ func (p *ProviderAdapter) Chat(ctx context.Context, request llm.Request) (llm.Re
 		opts = append(opts, option.WithBaseURL(p.baseURL))
 	}
 	client := sdkopenai.NewClient(opts...)
+	messages, err := convertMessages(request.Messages)
+	if err != nil {
+		return llm.Response{}, err
+	}
 
 	params := sdkopenai.ChatCompletionNewParams{
 		Model:    sdkopenai.ChatModel(request.Model),
-		Messages: convertMessages(request.Messages),
+		Messages: messages,
 		Tools:    convertTools(request.Tools),
 	}
 	if request.MaxTokens > 0 {
@@ -142,10 +147,14 @@ func (p *ProviderAdapter) ChatStream(ctx context.Context, request llm.Request, h
 		opts = append(opts, option.WithBaseURL(p.baseURL))
 	}
 	client := sdkopenai.NewClient(opts...)
+	messages, err := convertMessages(request.Messages)
+	if err != nil {
+		return llm.Response{}, err
+	}
 
 	params := sdkopenai.ChatCompletionNewParams{
 		Model:    sdkopenai.ChatModel(request.Model),
-		Messages: convertMessages(request.Messages),
+		Messages: messages,
 		Tools:    convertTools(request.Tools),
 		StreamOptions: sdkopenai.ChatCompletionStreamOptionsParam{
 			IncludeUsage: sdkopenai.Bool(true),
@@ -297,25 +306,106 @@ func emitStream(ctx context.Context, handler llm.StreamHandler, chunk llm.Stream
 	return handler(ctx, chunk)
 }
 
-func convertMessages(messages []llm.Message) []sdkopenai.ChatCompletionMessageParamUnion {
+func convertMessages(messages []llm.Message) ([]sdkopenai.ChatCompletionMessageParamUnion, error) {
 	result := make([]sdkopenai.ChatCompletionMessageParamUnion, 0, len(messages))
 	for _, message := range messages {
 		switch message.Role {
 		case llm.RoleSystem:
+			if hasImageInput(message) {
+				return nil, fmt.Errorf("llm/openai: image input is only supported for user messages")
+			}
 			result = append(result, sdkopenai.SystemMessage(message.Content))
 		case llm.RoleDeveloper:
+			if hasImageInput(message) {
+				return nil, fmt.Errorf("llm/openai: image input is only supported for user messages")
+			}
 			result = append(result, sdkopenai.DeveloperMessage(message.Content))
 		case llm.RoleUser:
-			result = append(result, sdkopenai.UserMessage(message.Content))
+			converted, err := convertUserMessage(message)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, converted)
 		case llm.RoleTool:
+			if hasImageInput(message) {
+				return nil, fmt.Errorf("llm/openai: image input is only supported for user messages")
+			}
 			result = append(result, sdkopenai.ToolMessage(message.Content, message.ToolCallID))
 		case llm.RoleAssistant:
+			if hasImageInput(message) {
+				return nil, fmt.Errorf("llm/openai: image input is only supported for user messages")
+			}
 			result = append(result, convertAssistantMessage(message))
 		default:
+			if hasImageInput(message) {
+				return nil, fmt.Errorf("llm/openai: image input is only supported for user messages")
+			}
 			result = append(result, sdkopenai.UserMessage(message.Content))
 		}
 	}
-	return result
+	return result, nil
+}
+
+func convertUserMessage(message llm.Message) (sdkopenai.ChatCompletionMessageParamUnion, error) {
+	if len(message.Input) == 0 {
+		return sdkopenai.UserMessage(message.Content), nil
+	}
+	parts, err := convertInputParts(message.Input)
+	if err != nil {
+		return sdkopenai.ChatCompletionMessageParamUnion{}, err
+	}
+	if len(parts) == 0 {
+		return sdkopenai.UserMessage(message.Content), nil
+	}
+	return sdkopenai.UserMessage(parts), nil
+}
+
+func convertInputParts(parts []llm.InputPart) ([]sdkopenai.ChatCompletionContentPartUnionParam, error) {
+	result := make([]sdkopenai.ChatCompletionContentPartUnionParam, 0, len(parts))
+	for _, part := range parts {
+		switch part.Type {
+		case llm.InputPartText:
+			if part.Text != "" {
+				result = append(result, sdkopenai.TextContentPart(part.Text))
+			}
+		case llm.InputPartImage:
+			url, err := inputImageURL(part.Image)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, sdkopenai.ImageContentPart(sdkopenai.ChatCompletionContentPartImageImageURLParam{
+				URL: url,
+			}))
+		default:
+			return nil, fmt.Errorf("llm/openai: unsupported input part type %q", part.Type)
+		}
+	}
+	return result, nil
+}
+
+func inputImageURL(image *llm.InputImage) (string, error) {
+	if image == nil {
+		return "", fmt.Errorf("llm/openai: image input is missing image data")
+	}
+	if image.URL != "" {
+		return image.URL, nil
+	}
+	if len(image.Data) == 0 {
+		return "", fmt.Errorf("llm/openai: image input requires url or data")
+	}
+	if image.MIMEType == "" {
+		return "", fmt.Errorf("llm/openai: image data requires mime type")
+	}
+	return "data:" + image.MIMEType + ";base64," + base64.StdEncoding.EncodeToString(image.Data), nil
+}
+
+func hasImageInput(message llm.Message) bool {
+	for _, part := range message.Input {
+		if part.Type == llm.InputPartImage {
+			return true
+		}
+	}
+	return false
 }
 
 func convertAssistantMessage(message llm.Message) sdkopenai.ChatCompletionMessageParamUnion {

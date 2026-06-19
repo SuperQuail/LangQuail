@@ -166,6 +166,7 @@ func estimateCompactMessages(ctx context.Context, estimator lqtoken.Estimator, r
 }
 
 func cloneMessage(message Message) Message {
+	message.Input = cloneInputParts(message.Input)
 	message.ToolCalls = cloneToolCalls(message.ToolCalls)
 	return message
 }

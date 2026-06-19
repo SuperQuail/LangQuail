@@ -37,3 +37,37 @@ func TestTiktokenEstimatorCountsPromptTokens(t *testing.T) {
 		t.Fatalf("RemainingTokens = %d", estimate.RemainingTokens)
 	}
 }
+
+func TestTiktokenEstimatorDoesNotTokenizeImageBytes(t *testing.T) {
+	estimator := token.NewTiktokenEstimator()
+	small, err := estimator.CountPromptTokens(context.Background(), token.EstimateRequest{
+		Model: "gpt-4o-mini",
+		Messages: []token.Message{{
+			Role: "user",
+			Input: []token.InputPart{
+				{Type: token.InputPartText, Text: "describe this"},
+				{Type: token.InputPartImage, Image: &token.InputImage{MIMEType: "image/png", Data: []byte{1}}},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CountPromptTokens(small) error = %v", err)
+	}
+	largeData := make([]byte, 4096)
+	large, err := estimator.CountPromptTokens(context.Background(), token.EstimateRequest{
+		Model: "gpt-4o-mini",
+		Messages: []token.Message{{
+			Role: "user",
+			Input: []token.InputPart{
+				{Type: token.InputPartText, Text: "describe this"},
+				{Type: token.InputPartImage, Image: &token.InputImage{MIMEType: "image/png", Data: largeData}},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CountPromptTokens(large) error = %v", err)
+	}
+	if small.InputTokens != large.InputTokens {
+		t.Fatalf("image bytes affected tiktoken estimate: small=%#v large=%#v", small, large)
+	}
+}

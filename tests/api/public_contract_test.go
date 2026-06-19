@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"sort"
@@ -136,6 +137,52 @@ func TestLLMPublicMessageAndProviderContracts(t *testing.T) {
 	toolMessage := llm.ToolResult("call_1", `{"answer":"ok"}`)
 	if toolMessage.Role != llm.RoleTool || toolMessage.ToolCallID != "call_1" || toolMessage.Content == "" {
 		t.Fatalf("ToolResult() = %#v", toolMessage)
+	}
+
+	imageData := []byte{1, 2, 3}
+	input := llm.UserInput(
+		llm.InputText("describe this"),
+		llm.InputImageURL("https://example.test/image.png"),
+		llm.InputImageData("image/png", imageData),
+	)
+	imageData[0] = 9
+	if input.Role != llm.RoleUser || input.Content != "describe this" || len(input.Input) != 3 {
+		t.Fatalf("UserInput() = %#v", input)
+	}
+	if input.Input[0].Type != llm.InputPartText || input.Input[0].Text != "describe this" {
+		t.Fatalf("InputText() = %#v", input.Input[0])
+	}
+	if input.Input[1].Type != llm.InputPartImage || input.Input[1].Image == nil || input.Input[1].Image.URL == "" {
+		t.Fatalf("InputImageURL() = %#v", input.Input[1])
+	}
+	if input.Input[2].Type != llm.InputPartImage || input.Input[2].Image == nil || input.Input[2].Image.MIMEType != "image/png" {
+		t.Fatalf("InputImageData() = %#v", input.Input[2])
+	}
+	if !bytes.Equal(input.Input[2].Image.Data, []byte{1, 2, 3}) {
+		t.Fatalf("InputImageData() did not clone source bytes: %v", input.Input[2].Image.Data)
+	}
+	input.Input[2].Image.Data[0] = 7
+	if imageData[0] != 9 {
+		t.Fatalf("mutating message image changed source bytes: %v", imageData)
+	}
+	assistantImageData := []byte{4, 5, 6}
+	assistantInput := llm.AssistantInput(
+		llm.InputText("created this"),
+		llm.InputImageData("image/png", assistantImageData),
+	)
+	assistantImageData[0] = 8
+	if assistantInput.Role != llm.RoleAssistant || assistantInput.Content != "created this" || len(assistantInput.Input) != 2 {
+		t.Fatalf("AssistantInput() = %#v", assistantInput)
+	}
+	if !bytes.Equal(assistantInput.Input[1].Image.Data, []byte{4, 5, 6}) {
+		t.Fatalf("AssistantInput() did not clone image bytes: %v", assistantInput.Input[1].Image.Data)
+	}
+	legacyJSON, err := json.Marshal(llm.User("plain text"))
+	if err != nil {
+		t.Fatalf("marshal legacy message: %v", err)
+	}
+	if strings.Contains(string(legacyJSON), `"input"`) {
+		t.Fatalf("legacy message included input field: %s", legacyJSON)
 	}
 
 	providers := llm.Providers(contractProvider{name: "alpha"}, contractProvider{})

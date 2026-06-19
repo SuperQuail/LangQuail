@@ -200,3 +200,67 @@ func TestOpenAIResponsesProviderMapsTextResponse(t *testing.T) {
 		t.Fatalf("message = %#v", response.Message)
 	}
 }
+
+func TestOpenAIResponsesProviderMapsImageInput(t *testing.T) {
+	handlerErrors := testutil.NewHandlerErrors(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			handlerErrors.Failf(w, "decode request: %v", err)
+			return
+		}
+		input, ok := body["input"].([]any)
+		if !ok || len(input) != 1 {
+			handlerErrors.Failf(w, "input = %#v", body["input"])
+			return
+		}
+		message := input[0].(map[string]any)
+		if message["role"] != "user" {
+			handlerErrors.Failf(w, "message = %#v", message)
+			return
+		}
+		content, ok := message["content"].([]any)
+		if !ok || len(content) != 2 {
+			handlerErrors.Failf(w, "content = %#v", message["content"])
+			return
+		}
+		text := content[0].(map[string]any)
+		if text["type"] != "input_text" || text["text"] != "describe this" {
+			handlerErrors.Failf(w, "text part = %#v", text)
+			return
+		}
+		image := content[1].(map[string]any)
+		if image["type"] != "input_image" || image["image_url"] != "data:image/png;base64,AQI=" || image["detail"] != "auto" {
+			handlerErrors.Failf(w, "image part = %#v", image)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp_image",
+			"object":"response",
+			"created_at":1,
+			"model":"test-model",
+			"output":[{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok","annotations":[]}]}],
+			"status":"completed",
+			"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4,"input_tokens_details":{},"output_tokens_details":{}}
+		}`))
+	}))
+	defer server.Close()
+
+	provider := lqresponses.Provider("openai.responses").APIKey("test-key").BaseURL(server.URL)
+	response, err := provider.Chat(context.Background(), llm.Request{
+		Model: "test-model",
+		Messages: []llm.Message{llm.UserInput(
+			llm.InputText("describe this"),
+			llm.InputImageData("image/png", []byte{1, 2}),
+		)},
+	})
+	if err != nil {
+		handlerErrors.AssertNone()
+		t.Fatalf("Chat() error = %v", err)
+	}
+	handlerErrors.AssertNone()
+	if response.Text != "ok" {
+		t.Fatalf("text = %q", response.Text)
+	}
+}

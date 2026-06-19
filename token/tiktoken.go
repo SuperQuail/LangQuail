@@ -30,7 +30,11 @@ func (e TiktokenEstimator) CountPromptTokens(_ context.Context, request Estimate
 		count := int64(3)
 		count += countText(encoding, message.Role)
 		count += countText(encoding, message.Name)
-		count += countText(encoding, message.Content)
+		if len(message.Input) > 0 {
+			count += countInputParts(encoding, message.Input)
+		} else {
+			count += countText(encoding, message.Content)
+		}
 		count += countText(encoding, message.ToolCallID)
 		for _, call := range message.ToolCalls {
 			count += countText(encoding, call.ID)
@@ -86,4 +90,24 @@ func countText(encoding *tiktoken.Tiktoken, text string) int64 {
 		return 0
 	}
 	return int64(len(encoding.Encode(text, nil, nil)))
+}
+
+func countInputParts(encoding *tiktoken.Tiktoken, parts []InputPart) int64 {
+	var count int64
+	for _, part := range parts {
+		count += countText(encoding, string(part.Type))
+		switch part.Type {
+		case InputPartText:
+			count += countText(encoding, part.Text)
+		case InputPartImage:
+			count += countText(encoding, "image")
+			if part.Image != nil {
+				count += countText(encoding, part.Image.URL)
+				count += countText(encoding, part.Image.MIMEType)
+			}
+		default:
+			count += countText(encoding, part.Text)
+		}
+	}
+	return count
 }

@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strings"
@@ -273,10 +274,33 @@ func toTokenMessages(messages []Message) []lqtoken.Message {
 		result = append(result, lqtoken.Message{
 			Role:       string(message.Role),
 			Content:    message.Content,
+			Input:      toTokenInputParts(message.Input),
 			Name:       message.Name,
 			ToolCallID: message.ToolCallID,
 			ToolCalls:  toTokenToolCalls(message.ToolCalls),
 		})
+	}
+	return result
+}
+
+func toTokenInputParts(parts []InputPart) []lqtoken.InputPart {
+	if len(parts) == 0 {
+		return nil
+	}
+	result := make([]lqtoken.InputPart, 0, len(parts))
+	for _, part := range parts {
+		converted := lqtoken.InputPart{
+			Type: lqtoken.InputPartType(part.Type),
+			Text: part.Text,
+		}
+		if part.Image != nil {
+			converted.Image = &lqtoken.InputImage{
+				URL:      part.Image.URL,
+				Data:     bytes.Clone(part.Image.Data),
+				MIMEType: part.Image.MIMEType,
+			}
+		}
+		result = append(result, converted)
 	}
 	return result
 }

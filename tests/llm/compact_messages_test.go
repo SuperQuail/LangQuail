@@ -1,6 +1,7 @@
 package llm_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"testing"
@@ -112,6 +113,65 @@ func TestCompactMessagesEstimatesActualMessages(t *testing.T) {
 	}
 	if estimator.requests[0].ContextLimit != 200 || estimator.requests[0].MaxOutputTokens != 20 {
 		t.Fatalf("budget was not applied: %#v", estimator.requests[0])
+	}
+}
+
+func TestCompactMessagesPreservesUnmodifiedImageInput(t *testing.T) {
+	messages := []llm.Message{
+		llm.UserInput(
+			llm.InputText("look"),
+			llm.InputImageData("image/png", []byte{1, 2}),
+		),
+		llm.User("verbose details"),
+	}
+	compacted, _, err := llm.CompactMessages(context.Background(), messages, prompt.CompactPlan{Ops: []prompt.CompactOp{
+		prompt.ReplaceSegment(llm.MessageSegmentID(1), prompt.Segment{
+			ID:      llm.MessageSegmentID(1),
+			Role:    string(llm.RoleUser),
+			Content: "summary",
+		}),
+	}})
+	if err != nil {
+		t.Fatalf("CompactMessages() error = %v", err)
+	}
+	if len(compacted) != 2 {
+		t.Fatalf("compacted = %#v", compacted)
+	}
+	if len(compacted[0].Input) != 2 || compacted[0].Input[1].Image == nil {
+		t.Fatalf("image input was not preserved: %#v", compacted[0])
+	}
+	if !bytes.Equal(compacted[0].Input[1].Image.Data, []byte{1, 2}) {
+		t.Fatalf("image data = %v", compacted[0].Input[1].Image.Data)
+	}
+	compacted[0].Input[1].Image.Data[0] = 9
+	if messages[0].Input[1].Image.Data[0] != 1 {
+		t.Fatalf("compacted image aliases original: %v", messages[0].Input[1].Image.Data)
+	}
+	if len(compacted[1].Input) != 0 || compacted[1].Content != "summary" {
+		t.Fatalf("replacement message = %#v", compacted[1])
+	}
+}
+
+func TestCompactMessagesEstimatesImageInput(t *testing.T) {
+	estimator := &messageCompactEstimator{}
+	_, _, err := llm.CompactMessages(context.Background(), []llm.Message{
+		llm.UserInput(
+			llm.InputText("look"),
+			llm.InputImageData("image/png", []byte{1, 2}),
+		),
+	}, prompt.CompactPlan{}, llm.WithCompactEstimator(estimator), llm.WithCompactEstimateRequest(token.EstimateRequest{Model: "fake-model"}))
+	if err != nil {
+		t.Fatalf("CompactMessages() error = %v", err)
+	}
+	if len(estimator.requests) != 2 {
+		t.Fatalf("requests = %#v", estimator.requests)
+	}
+	message := estimator.requests[0].Messages[0]
+	if len(message.Input) != 2 || message.Input[1].Image == nil {
+		t.Fatalf("estimate message input = %#v", message.Input)
+	}
+	if message.Input[1].Image.MIMEType != "image/png" || !bytes.Equal(message.Input[1].Image.Data, []byte{1, 2}) {
+		t.Fatalf("estimate image = %#v", message.Input[1].Image)
 	}
 }
 
